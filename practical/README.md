@@ -6,12 +6,13 @@ deliverable: no real provider, Salesforce org or broker is called.
 ## Stack and versions
 
 - Java 21 (Temurin 21.0.12.1), Maven 3.9.16.
-- JUnit Jupiter 5.11.4 and Jackson databind 2.18.2, both from Maven Central.
+- JUnit Jupiter 5.11.4 and Jackson databind 2.18.12, both from Maven Central. Jackson is on 2.18.12
+  because the image scan flagged 2.18.2 with five high-severity advisories, all fixed by 2.18.11.
 - networknt json-schema-validator 2.0.8, **test scope only**: the conformance test validates the
   events this code produces against `docs/api/events/premium-payment.schema.json`. The schema is
   read from the repository, never copied, so a changed contract cannot keep passing unnoticed.
-- Plain Java libraries, no framework. The HTTP surface is a handler with no server and no framework
-  attached yet.
+- Plain Java libraries, no framework. `IntakeServer` adapts the endpoint to the JDK's `HttpServer`, and
+  the shade plugin builds one runnable jar so the container image needs a JRE and nothing else.
 
 ## Build and test
 
@@ -41,12 +42,15 @@ samples from `reference/providers/` and the event schema from `docs/api/`.
 ```text
 practical/
   pom.xml
+  Dockerfile
   src/main/java/com/meridian/payments/intake/
     NotificationIntake.java          authenticity, then event, then durability
+    IntakeApplication.java           the process: endpoint on a port, publisher on a loop
     IntakeOutcome.java               ACCEPTED or DUPLICATE, with the event
     WebhookRejectedException.java    not authentic, not read
     http/
       WebhookEndpoint.java           the two published paths and their status codes
+      IntakeServer.java              the JDK HttpServer adapter
       HttpRequest.java               path, headers and raw body
       HttpResponse.java              status, headers and body
     auth/
@@ -92,6 +96,7 @@ practical/
     publish/CanonicalEventPublisherTest.java
     publish/PublisherLoopTest.java
     http/WebhookEndpointTest.java
+    http/IntakeServerTest.java
     canonical/
       CanonicalEventContractTest.java       produced events against the published schema
       QuetzalCanonicalEventMapperTest.java
@@ -224,9 +229,29 @@ Two deliberate omissions: no `202` on any path, because the `2xx` is a durabilit
 intent; and no content-type gate, because the contract declares a JSON body and its error vocabulary
 has no code for an unsupported media type, so inventing one would break the contract it implements.
 
+## Running it
+
+The image is buildable and was exercised. What a container answered, with a body signed the way the
+provider signs it:
+
+```sh
+docker build -t premium-payment-intake:local practical
+docker run --rm -p 8080:8080 \
+  -e QUETZAL_WEBHOOK_SECRET=<sandbox vector> \
+  -e ANDINA_WEBHOOK_SECRET=<sandbox vector> \
+  premium-payment-intake:local
+```
+
+- first delivery: `200 {"status":"ACCEPTED"}`
+- the same body again: `200 {"status":"DUPLICATE"}`
+- a tampered signature: `401 {"error":{"code":"SIGNATURE_INVALID",...}}`
+
+Three adapters are in-memory in this process: the store, the broker and the secret source (the
+environment). Everything between them is the tested implementation.
+
 ## Tests and evidence
 
-120 JUnit 5 tests.
+122 JUnit 5 tests.
 
 Authentication (51):
 
@@ -283,6 +308,11 @@ HTTP surface (8):
 - a store failure is a `503` with `Retry-After`;
 - an unpublished path is a `404`.
 
+HTTP adapter (2):
+
+- a signed provider sample over a real socket is answered `200` and leaves a durable event;
+- a `GET` on the webhook path is `405`, not a webhook.
+
 RED/GREEN evidence was captured from the container build for the first two lots:
 
 - authentication: 51 tests, 50 failing before the implementation (assertion failures, no compilation
@@ -304,8 +334,11 @@ no red-phase capture; their evidence is the full suite green plus the injected f
 
 ## Known gaps
 
-- No server process: `WebhookEndpoint` is a handler with no framework or runtime adapter attached, so
-  nothing listens on a port. The contract, the status codes and the bodies are complete and tested.
+- Secrets come from the environment in the runnable image. `SecretProvider` is the boundary the design
+  fixes; the Key Vault adapter is the piece still missing, even though the vault and the role
+  assignment exist in `infra/`.
+- The process runs with the in-memory store and the recording broker, so two replicas would not share
+  state. That is a property of the stubs, not of the interfaces.
 - No dead-letter rule: a publication that keeps failing retries forever with a sixty-second cap. Part
   A's design puts the dead letter on the broker and on the relay; here the job simply stays pending.
 - No claim or lease on the outbox row, which one process does not need and two would.
