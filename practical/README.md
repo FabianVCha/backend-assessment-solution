@@ -6,7 +6,8 @@ deliverable: no real provider, Salesforce org or broker is called.
 ## Stack and versions
 
 - Java 21 (Temurin 21.0.12.1), Maven 3.9.16.
-- JUnit Jupiter 5.11.4 and Jackson databind 2.18.2, both from Maven Central.
+- JUnit Jupiter 5.11.4 and Jackson databind 2.18.12, both from Maven Central. Jackson is on 2.18.12
+  because the image scan flagged 2.18.2 with five high-severity advisories, all fixed by 2.18.11.
 - networknt json-schema-validator 2.0.8, **test scope only**: the conformance test validates the
   events this code produces against `docs/api/events/premium-payment.schema.json`. The schema is
   read from the repository, never copied, so a changed contract cannot keep passing unnoticed.
