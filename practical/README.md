@@ -94,6 +94,8 @@ practical/
       BrokerUnavailableException.java the ack never came
   src/main/resources/db/migration/
     V1__intake.sql                   the inbox, the outbox and their indexes
+    V2__claims.sql                   the claim columns, the CLAIMED state and the lease index
+    V3__payment_state.sql            the projection keyed by payment, not by notification
   src/test/java/com/meridian/payments/intake/
     TestSamples.java                 published samples and the schema path
     MutableClock.java                a clock the tests move by hand
@@ -212,7 +214,24 @@ application's:
   `refunded_amount_semantics` as mandatory, and the real Quetzal sample — where it is null — stopped
   publishing in the running container while the hand-built fixture passed;
 - the retry curve exists twice, in `RetrySchedule` and in the SQL that schedules the row. One
-  integration test pins them together: one failure schedules a second, the next two, then four.
+  integration test pins them together: one failure schedules a second, the next two, then four;
+- the payment projection (`payment_state`) moves inside the same transaction. It keeps the newest status
+  by the provider's own timestamp, so a capture that arrives late cannot undo a reversal, and its
+  `remote_applied_status` is written by nobody yet: a local insert is not evidence that Salesforce
+  applied anything.
+
+### What a crash proves
+
+The property is not "it starts again", it is "the acknowledged payment is still there and still owed".
+
+Measured with the built image against PostgreSQL 16: a signed event was accepted (`200 ACCEPTED`), the
+container was killed with `SIGKILL` one second later, and the database held one event, two jobs and one
+projection row with zero published. A fresh container on the same database, with no other replica
+running, published the pending canonical event on its first tick and logged it. The Salesforce job stayed
+pending, because no relay owns it yet.
+
+What that does not prove: a database or region failure. That needs the backup and restore drill, and it
+is not claimed here.
 
 ## Implemented: publication to the canonical topic (FR6)
 
@@ -315,7 +334,7 @@ store is no longer one of them.
 
 ## Tests and evidence
 
-142 JUnit 5 tests: 133 need nothing but a JVM, and 9 more run against a real PostgreSQL when
+146 JUnit 5 tests: 129 need nothing but a JVM, and 17 more run against a real PostgreSQL when
 `INTAKE_IT_JDBC_URL` is set (CI sets it, so they are a gate and not a local habit).
 
 Authentication (51):
@@ -342,7 +361,7 @@ Canonical mapping (43):
 - the stored document round-trips back to the same event for a captured charge (where the refund
   semantics are null), a refunded charge, and a Colombian reversal.
 
-PostgreSQL store (13, skipped without a database):
+PostgreSQL store (17, skipped without a database):
 
 - one accept writes one event and two jobs, counted in the tables;
 - a second delivery is `DUPLICATE` and the counts do not move;
@@ -356,7 +375,9 @@ PostgreSQL store (13, skipped without a database):
 - two workers claim disjoint jobs and a third finds the lane empty;
 - an expired lease is reclaimable, and the worker that lost it gets `ClaimLostException`;
 - a job read without a claim cannot be completed;
-- two publisher replicas over the same table send each event once.
+- two publisher replicas over the same table send each event once;
+- the projection keeps the newest status by the provider clock, a late capture does not replace a newer
+  reversal, a duplicate is counted once, and a rolled-back accept leaves no projection row.
 
 Store and intake (16):
 
@@ -428,8 +449,8 @@ no red-phase capture; their evidence is the full suite green plus the injected f
   process split into roles.
 - No dead-letter rule: a publication that keeps failing retries forever with a sixty-second cap. Part
   A's design puts the dead letter on the broker and on the relay; here the job simply stays pending.
-- No crash-and-restart transcript in this change: the schema and the transaction survive a restart, and
-  the evidence for it is the next slice.
+- The crash evidence is one container killed and restarted against the same database. A database
+  failover, a region failure and a restore from backup are not tested, and nothing here claims them.
 - No relay to Salesforce: the `SALESFORCE` job is recorded and never processed, so no batching, no
   backoff and no dead letter on that path.
 - Content-type is not gated, on purpose: the contract declares a JSON body and its error enum has no
