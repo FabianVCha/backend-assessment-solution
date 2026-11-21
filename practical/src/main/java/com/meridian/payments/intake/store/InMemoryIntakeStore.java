@@ -6,10 +6,12 @@ import com.meridian.payments.intake.canonical.CanonicalEvent;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.UUID;
 
 /**
  * In-memory stand-in for the inbox and the outbox.
@@ -37,6 +39,9 @@ public final class InMemoryIntakeStore implements IntakeStore, OutboxStore {
         private int attempts;
         private boolean published;
         private Instant nextAttemptAt;
+        private String claimToken;
+        private String claimOwner;
+        private Instant claimExpiresAt;
 
         private JobState(CanonicalEvent event) {
             this.event = event;
@@ -110,10 +115,55 @@ public final class InMemoryIntakeStore implements IntakeStore, OutboxStore {
     }
 
     @Override
+    public List<PendingJob> claim(Destination destination, int limit, String owner, Duration lease) {
+        Objects.requireNonNull(destination, "destination");
+        Objects.requireNonNull(owner, "owner");
+        Objects.requireNonNull(lease, "lease");
+        if (limit < 1) {
+            throw new IllegalArgumentException("a batch needs at least one job");
+        }
+        if (lease.isNegative() || lease.isZero()) {
+            throw new IllegalArgumentException("a lease must last longer than nothing");
+        }
+        Instant now = clock.instant();
+        String token = UUID.randomUUID().toString();
+        synchronized (lock) {
+            List<PendingJob> claimed = new ArrayList<>();
+            for (Map.Entry<OutboxJob, JobState> entry : outbox.entrySet()) {
+                if (entry.getKey().destination() != destination) {
+                    continue;
+                }
+                JobState state = entry.getValue();
+                if (state.published || heldByALiveWorker(state, now) || notDue(state, now)) {
+                    continue;
+                }
+                state.claimToken = token;
+                state.claimOwner = owner;
+                state.claimExpiresAt = now.plus(lease);
+                claimed.add(new PendingJob(entry.getKey(), state.event, token));
+                if (claimed.size() == limit) {
+                    break;
+                }
+            }
+            return claimed;
+        }
+    }
+
+    private static boolean heldByALiveWorker(JobState state, Instant now) {
+        return state.claimToken != null && state.claimExpiresAt != null && state.claimExpiresAt.isAfter(now);
+    }
+
+    private static boolean notDue(JobState state, Instant now) {
+        return state.nextAttemptAt != null && state.nextAttemptAt.isAfter(now);
+    }
+
+    @Override
     public void published(PendingJob job) {
         Objects.requireNonNull(job, "job");
         synchronized (lock) {
-            state(job).published = true;
+            JobState state = claimedState(job);
+            state.published = true;
+            clearClaim(state);
         }
     }
 
@@ -122,10 +172,28 @@ public final class InMemoryIntakeStore implements IntakeStore, OutboxStore {
     public void failed(PendingJob job, String reason) {
         Objects.requireNonNull(job, "job");
         synchronized (lock) {
-            JobState state = state(job);
+            JobState state = claimedState(job);
             state.attempts++;
             state.nextAttemptAt = clock.instant().plus(backoff(state.attempts));
+            clearClaim(state);
         }
+    }
+
+    private JobState claimedState(PendingJob job) {
+        if (!job.claimed()) {
+            throw new IllegalArgumentException("a job must be claimed before it can be completed");
+        }
+        JobState state = state(job);
+        if (!job.claimToken().equals(state.claimToken)) {
+            throw new ClaimLostException("the lease on this job belongs to another worker now");
+        }
+        return state;
+    }
+
+    private static void clearClaim(JobState state) {
+        state.claimToken = null;
+        state.claimOwner = null;
+        state.claimExpiresAt = null;
     }
 
     /** Attempts recorded for one job, so a test can tell a failure from a lost job. */

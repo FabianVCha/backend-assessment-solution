@@ -17,7 +17,9 @@ import java.sql.Statement;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -25,6 +27,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
@@ -205,11 +208,12 @@ class PostgresIntakeStoreIT {
 
     /** The SQL implements the same curve as {@link RetrySchedule}; this is what pins the two. */
     @Test
-    void aFailedAttemptSchedulesTheSameCurveAsTheInMemoryStore() {
+    void aFailedAttemptSchedulesTheSameCurveAsTheInMemoryStore() throws InterruptedException {
         store.accept(event(Provider.QUETZAL, "evt-retry"));
-        PendingJob job = store.pending(Destination.CANONICAL_EVENT, 1).get(0);
 
-        for (int attempt = 1; attempt <= 4; attempt++) {
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            PendingJob job = store.claim(
+                    Destination.CANONICAL_EVENT, 1, "worker", Duration.ofSeconds(30)).get(0);
             Instant before = Instant.now();
             store.failed(job, "the broker is down");
             Instant due = store.nextAttemptAt(
@@ -220,7 +224,92 @@ class PostgresIntakeStoreIT {
             assertTrue(wait.compareTo(expected.minus(TOLERANCE)) >= 0
                             && wait.compareTo(expected.plus(TOLERANCE)) <= 0,
                     "attempt " + attempt + ": expected about " + expected + ", database scheduled " + wait);
+
+            // Wait for the row to be due; the next claim would otherwise find nothing, and that is the
+            // schedule working as intended rather than a reason to make the lease longer.
+            Thread.sleep(Math.max(0, Duration.between(Instant.now(), due).toMillis()) + 100);
         }
+    }
+
+    /**
+     * Two workers polling at the same instant split the batch. The database decides with
+     * {@code FOR UPDATE SKIP LOCKED}: a job is handed to one claimant, not to both.
+     */
+    @Test
+    void twoWorkersClaimDisjointJobs() {
+        for (String id : List.of("evt-a", "evt-b", "evt-c", "evt-d")) {
+            store.accept(event(Provider.QUETZAL, id));
+        }
+
+        List<PendingJob> first = store.claim(
+                Destination.CANONICAL_EVENT, 2, "worker-a", Duration.ofSeconds(30));
+        List<PendingJob> second = store.claim(
+                Destination.CANONICAL_EVENT, 2, "worker-b", Duration.ofSeconds(30));
+
+        assertEquals(2, first.size());
+        assertEquals(2, second.size());
+        Set<String> claimed = new HashSet<>();
+        first.forEach(job -> claimed.add(job.job().eventId()));
+        second.forEach(job -> claimed.add(job.job().eventId()));
+        assertEquals(4, claimed.size(), "no job was handed to both workers");
+        assertEquals(List.of(),
+                store.claim(Destination.CANONICAL_EVENT, 4, "worker-c", Duration.ofSeconds(30)),
+                "the whole lane is claimed");
+    }
+
+    /**
+     * A worker that dies holding a lease must not park the payment. When the lease expires the job is
+     * due again, and the worker that took over is the only one that can complete it.
+     */
+    @Test
+    void anExpiredLeaseCanBeReclaimedAndTheOldTokenCompletesNothing()
+            throws InterruptedException, SQLException {
+        store.accept(event(Provider.QUETZAL, "evt-lease"));
+        PendingJob stale = store.claim(
+                Destination.CANONICAL_EVENT, 1, "worker-a", Duration.ofSeconds(1)).get(0);
+
+        Thread.sleep(1_200);
+
+        PendingJob current = store.claim(
+                Destination.CANONICAL_EVENT, 1, "worker-b", Duration.ofSeconds(30)).get(0);
+
+        assertEquals(stale.job(), current.job(), "the work came back after the lease died");
+        assertNotEquals(stale.claimToken(), current.claimToken());
+        assertThrows(ClaimLostException.class, () -> store.published(stale),
+                "the expired worker must not mark someone else's job done");
+        assertEquals(1, count("SELECT count(*) FROM outbox_job WHERE state = 'CLAIMED'"),
+                "the job still belongs to the worker that took it");
+
+        store.published(current);
+        assertEquals(1, count("SELECT count(*) FROM outbox_job WHERE state = 'PUBLISHED'"));
+    }
+
+    @Test
+    void aJobReadWithoutAClaimCannotBeCompleted() {
+        store.accept(event(Provider.QUETZAL, "evt-read"));
+        PendingJob read = store.pending(Destination.CANONICAL_EVENT, 1).get(0);
+
+        assertThrows(IllegalArgumentException.class, () -> store.published(read),
+                "reading is not claiming");
+    }
+
+    /** Two publisher replicas over the same table: each event is sent once, not twice. */
+    @Test
+    void twoReplicasPublishEachEventOnce() {
+        for (String id : List.of("evt-1", "evt-2")) {
+            store.accept(event(Provider.QUETZAL, id));
+        }
+        List<CanonicalMessage> sent = new ArrayList<>();
+        Broker broker = sent::add;
+        CanonicalEventPublisher first = new CanonicalEventPublisher(store, broker, 10, "replica-a");
+        CanonicalEventPublisher second = new CanonicalEventPublisher(store, broker, 10, "replica-b");
+
+        int total = first.publishPending() + second.publishPending()
+                + first.publishPending() + second.publishPending();
+
+        assertEquals(2, total);
+        assertEquals(2, sent.size(), "no event was sent twice");
+        assertEquals(2, sent.stream().map(CanonicalMessage::messageId).distinct().count());
     }
 
     private static CanonicalEvent event(Provider provider, String eventId) {

@@ -80,7 +80,8 @@ practical/
       InMemoryIntakeStore.java       in-memory double of the same rules, for the demo
       Acceptance.java                ACCEPTED or DUPLICATE
       OutboxJob.java                 one unit of work per destination
-      PendingJob.java                a job with the event it carries
+      PendingJob.java                a job with the event it carries and the claim it was handed
+      ClaimLostException.java        the lease expired and someone else owns the job
       Destination.java               SALESFORCE and CANONICAL_EVENT
       StoreUnavailableException.java nothing was written
     publish/
@@ -233,10 +234,29 @@ application's:
   depend on a human or on a request arriving;
 - a tick never kills the loop: a broker failure becomes a pending job with a scheduled retry, and
   anything unexpected is logged and the next tick tries again;
+- the batch is claimed before it is sent, so two replicas polling the same table split the work
+  instead of both sending the same message. A lease that expires returns the job to the queue, and the
+  worker that outlived it cannot complete someone else's work;
 - the wait between attempts belongs to the outbox row, as the design places `next_attempt_at` there:
   one second, doubling, capped at sixty. `pending()` returns only the rows that are due, so a broken
   broker cannot turn the loop into a hot spin;
 - log lines carry a count only: no provider identifier, no policy number, no payload.
+
+### Claims and leases
+
+Draining is not reading. `OutboxStore.claim` takes a bounded batch under a lease and hands back a token,
+and every completion presents that token:
+
+- in PostgreSQL the claim is `SELECT ... FOR UPDATE SKIP LOCKED` followed by an `UPDATE` inside one
+  transaction, so a second worker takes the next rows instead of blocking or duplicating the first;
+- `published` and `failed` update the row only where the token matches. A worker whose lease expired
+  changes zero rows and gets a `ClaimLostException`: it logs the loss and leaves the job to its owner;
+- an expired lease is due again, so a replica that dies mid-publication does not park the payment. The
+  next poll — this replica after a restart, or another one — takes it;
+- a job read through `pending` has no token and cannot be completed. Reading is not claiming.
+
+The lease is thirty seconds: long enough for one broker call and the commit, short enough that a crash
+costs a poll rather than a payment.
 
 ## Implemented: HTTP surface
 
@@ -295,7 +315,7 @@ store is no longer one of them.
 
 ## Tests and evidence
 
-134 JUnit 5 tests: 125 need nothing but a JVM, and 9 more run against a real PostgreSQL when
+142 JUnit 5 tests: 133 need nothing but a JVM, and 9 more run against a real PostgreSQL when
 `INTAKE_IT_JDBC_URL` is set (CI sets it, so they are a gate and not a local habit).
 
 Authentication (51):
@@ -309,7 +329,7 @@ Authentication (51):
 - a logging capture proves no secret, signature, body or payer value is logged;
 - a source scan proves no sandbox secret material exists under `src/main`.
 
-Canonical mapping (40):
+Canonical mapping (43):
 
 - every one of the seven samples produces an event that the published JSON Schema accepts;
 - both providers are asserted field by field, including the UTC conversion and the cents conversion;
@@ -322,7 +342,7 @@ Canonical mapping (40):
 - the stored document round-trips back to the same event for a captured charge (where the refund
   semantics are null), a refunded charge, and a Colombian reversal.
 
-PostgreSQL store (9, skipped without a database):
+PostgreSQL store (13, skipped without a database):
 
 - one accept writes one event and two jobs, counted in the tables;
 - a second delivery is `DUPLICATE` and the counts do not move;
@@ -332,15 +352,21 @@ PostgreSQL store (9, skipped without a database):
 - the canonical publisher drains its lane and leaves the Salesforce job pending;
 - what the publisher reads equals what was accepted;
 - the scheduled retry follows `RetrySchedule`: one second, then two, then four;
-- the schema in the database was applied by a recorded migration.
+- the schema in the database was applied by a recorded migration;
+- two workers claim disjoint jobs and a third finds the lane empty;
+- an expired lease is reclaimable, and the worker that lost it gets `ClaimLostException`;
+- a job read without a claim cannot be completed;
+- two publisher replicas over the same table send each event once.
 
-Store and intake (12):
+Store and intake (16):
 
 - the first acceptance writes the event and one job per destination;
 - a duplicate adds no event and no job, and the same id from another provider is a different event;
 - a store that fails before or in the middle of the transaction leaves nothing behind, and the retry
   then succeeds;
 - a failed attempt is withheld until its next attempt time, and the wait doubles;
+- a claimed job is not offered twice while the lease lives, an expired lease comes back with a new
+  token, and a stale token cannot complete the job;
 - over the real pipeline: a signed Quetzal notification is accepted, the Andina retry is a duplicate
   while a new state is a new event, an invalid signature and an unmappable reference store nothing,
   authenticity is checked before parsing, and a store failure reaches the caller instead of becoming
@@ -398,9 +424,6 @@ no red-phase capture; their evidence is the full suite green plus the injected f
   assignment exist in `infra/`.
 - The process runs with the recording broker, so a published message goes to a log line. The store is
   durable; the next hop is not yet.
-- No claim or lease on the outbox row. One process does not need it; two replicas polling the same
-  table would publish the same message twice, which the consumer's deduplication covers but which is
-  waste and hides a real defect. This is the next slice.
 - The pool is one size for the whole process (eight connections). Per-role pools belong with the
   process split into roles.
 - No dead-letter rule: a publication that keeps failing retries forever with a sixty-second cap. Part
