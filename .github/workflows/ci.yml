@@ -82,3 +82,18 @@ jobs:
           severity: CRITICAL,HIGH
           ignore-unfixed: true
           exit-code: '1'
+
+  workflows:
+    name: the workflows are valid
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned release, no third-party action: a linter that runs from a moving tag is not a gate.
+      - name: install actionlint
+        run: |
+          curl -sSL -o actionlint.tgz \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          tar xzf actionlint.tgz actionlint
+          ./actionlint --version
+      - name: lint
+        run: ./actionlint -color
