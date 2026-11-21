@@ -15,11 +15,15 @@ import com.meridian.payments.intake.http.WebhookEndpoint;
 import com.meridian.payments.intake.publish.Broker;
 import com.meridian.payments.intake.publish.CanonicalEventPublisher;
 import com.meridian.payments.intake.publish.PublisherLoop;
+import com.meridian.payments.intake.salesforce.SalesforceRelay;
+import com.meridian.payments.intake.salesforce.SalesforceRelayLoop;
+import com.meridian.payments.intake.salesforce.SimulatedSalesforce;
 import com.meridian.payments.intake.store.Database;
 import com.meridian.payments.intake.store.InMemoryIntakeStore;
 import com.meridian.payments.intake.store.IntakeStore;
 import com.meridian.payments.intake.store.OutboxStore;
 import com.meridian.payments.intake.store.PostgresIntakeStore;
+import com.meridian.payments.intake.store.PostgresSalesforceStore;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -97,9 +101,21 @@ public final class IntakeApplication {
                 clock);
 
         CanonicalEventPublisher publisher = new CanonicalEventPublisher(outboxStore, broker, 50);
+        // The Salesforce lane runs only with the durable store: it needs the projection and the claims, and
+        // the in-memory demo has neither. The client is the simulator, so no real Salesforce call is made.
+        SalesforceRelayLoop relay = database == null ? null : new SalesforceRelayLoop(
+                new SalesforceRelay(
+                        new PostgresSalesforceStore(database),
+                        new SimulatedSalesforce(),
+                        25),
+                Duration.ofSeconds(10));
         try (PublisherLoop loop = new PublisherLoop(publisher, Duration.ofSeconds(10));
+             SalesforceRelayLoop relayLoop = relay;
              IntakeServer server = IntakeServer.start(new WebhookEndpoint(intake), port)) {
             loop.start();
+            if (relayLoop != null) {
+                relayLoop.start();
+            }
             LOG.info("intake listening on port " + server.port() + " with " + store + " store, "
                     + "recording broker and environment-provided secrets");
             Thread.currentThread().join();

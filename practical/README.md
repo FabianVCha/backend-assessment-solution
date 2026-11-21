@@ -92,10 +92,19 @@ practical/
       CanonicalMessage.java          message id, correlation id and body
       MessageIds.java                the derived, stable message id
       BrokerUnavailableException.java the ack never came
+    salesforce/
+      SalesforceClient.java          the port: what to write, and the nine answers that matter
+      SalesforceRelay.java           one batch, classified: applied, terminal, held or retry
+      SalesforceRelayLoop.java       the tick that drains the lane without a human
+      SimulatedSalesforce.java       scripted destination, so the fault matrix is tested
+    store/
+      SalesforceStore.java           the lane's endings: applied, terminal, ambiguous
+      PostgresSalesforceStore.java   claiming, ordering by the provider clock, three endings
   src/main/resources/db/migration/
     V1__intake.sql                   the inbox, the outbox and their indexes
     V2__claims.sql                   the claim columns, the CLAIMED state and the lease index
     V3__payment_state.sql            the projection keyed by payment, not by notification
+    V4__salesforce_lane.sql          DEAD and HELD, the outcome code and the in-flight index
   src/test/java/com/meridian/payments/intake/
     TestSamples.java                 published samples and the schema path
     MutableClock.java                a clock the tests move by hand
@@ -300,6 +309,38 @@ Two deliberate omissions: no `202` on any path, because the `2xx` is a durabilit
 intent; and no content-type gate, because the contract declares a JSON body and its error vocabulary
 has no code for an unsupported media type, so inventing one would break the contract it implements.
 
+## Implemented: the Salesforce lane
+
+`SalesforceRelay` drains the `SALESFORCE` destination the canonical publisher deliberately leaves alone, so
+a broker outage and a Salesforce outage stay separate failures.
+
+- **Ordering comes from the provider's clock, not from arrival.** Before writing, the relay reads the
+  payment projection. An event whose `status_changed_at` is older than the payment's newest fact is skipped
+  and marked `STALE_SKIPPED`: a delayed capture cannot replace a reversal that already landed.
+- **One writer per payment.** The claim excludes any payment that already has a write in flight, so two
+  replicas do not push two facts for one payment at the same moment; within a batch the writes are serial.
+  The residual window — two claims starting in the same instant — is real and stated rather than papered
+  over: only the destination can close it completely, and that needs an agreement with Salesforce.
+- **Every answer is classified, never thrown:**
+
+| Salesforce answer | What it means | What the relay does |
+|---|---|---|
+| applied | written | `PUBLISHED` / `APPLIED`; the projection records the applied status |
+| partial batch | some items landed | retried, `PARTIAL` |
+| `INVALID_FIELD` | wrong field or value | `DEAD` / `INVALID_FIELD`; a human corrects it |
+| `UNABLE_TO_LOCK_ROW` | a `400` that means "later" | retried with the same 1 s → 60 s curve |
+| `INVALID_SESSION_ID` | session expired | one refresh inside the client, then retry |
+| `403 REQUEST_LIMIT_EXCEEDED` | daily budget gone | the lane stops and the rest go back to pending |
+| `5xx` | remote failure | bounded retry |
+| timeout | outcome unknown | bounded retry, `TIMEOUT` |
+| applied but response lost | outcome unknown and possibly landed | `HELD` / `LOST_RESPONSE`, never retried |
+
+`HELD` exists for the last row and for nothing else. Retrying it would duplicate a fact; marking it done
+would claim a success nobody observed. It is the one state the relay refuses to resolve by itself.
+
+The client is `SimulatedSalesforce`: the fault matrix is scripted per test and no real Salesforce call is
+made anywhere in this repository. The port is the seam where a real client goes.
+
 ## Running it
 
 Two profiles. The durable one needs nothing but Docker:
@@ -338,7 +379,7 @@ store is no longer one of them.
 
 ## Tests and evidence
 
-175 JUnit 5 tests: 158 need nothing but a JVM, and 17 more run against a real PostgreSQL when
+184 JUnit 5 tests: 158 need nothing but a JVM, and 26 more run against a real PostgreSQL when
 `INTAKE_IT_JDBC_URL` is set (CI sets it, so they are a gate and not a local habit).
 
 Authentication (51):
@@ -382,6 +423,18 @@ PostgreSQL store (17, skipped without a database):
 - two publisher replicas over the same table send each event once;
 - the projection keeps the newest status by the provider clock, a late capture does not replace a newer
   reversal, a duplicate is counted once, and a rolled-back accept leaves no projection row.
+
+Salesforce lane (9, against a database and a scripted destination):
+
+- an applied write marks the job `APPLIED` and records the applied status on the projection;
+- an invalid field is `DEAD` and is never sent again;
+- a locked row is rescheduled with the same 1 s → 60 s curve;
+- a rate limit stops the lane and puts the rest back to pending;
+- a lost response is `HELD`, the projection claims nothing, and it is never retried;
+- a timeout is retried instead of being called ambiguous;
+- an older event is skipped and the newer one applied, with one write to the destination;
+- a payment with a write in flight is not claimed by another worker;
+- a completion with a stale token changes nothing.
 
 Store and intake (16):
 
@@ -455,8 +508,10 @@ no red-phase capture; their evidence is the full suite green plus the injected f
   A's design puts the dead letter on the broker and on the relay; here the job simply stays pending.
 - The crash evidence is one container killed and restarted against the same database. A database
   failover, a region failure and a restore from backup are not tested, and nothing here claims them.
-- No relay to Salesforce: the `SALESFORCE` job is recorded and never processed, so no batching, no
-  backoff and no dead letter on that path.
+- No relay against a real Salesforce: the client is a simulator with a scripted fault matrix. The port is
+  the seam, and the real client needs the sandbox contract and its session handling.
+- No shared usage guard yet: the relay classifies `403 REQUEST_LIMIT_EXCEEDED` and stops the lane, but
+  nothing counts calls against the 150,000/day budget before making them.
 - Content-type is not gated, on purpose: the contract declares a JSON body and its error enum has no
   code for an unsupported media type.
 - `paid_at` and `refunded_at` fall back to `created` when absent. A stricter reading would reject
