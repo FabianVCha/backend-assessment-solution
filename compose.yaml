@@ -38,6 +38,7 @@ services:
       # exercise fixtures, not provider credentials, and the marker says so to the secrets gate.
       QUETZAL_WEBHOOK_SECRET: qz_test_whsec_4f8a1c2e9b7d # gitleaks:allow
       ANDINA_WEBHOOK_SECRET: andina_test_secret_7c3e19ab # gitleaks:allow
+      AUSTRAL_WEBHOOK_SECRET: aus_test_whsec_2b9d6f10 # gitleaks:allow
     ports:
       - "127.0.0.1:8080:8080"
 

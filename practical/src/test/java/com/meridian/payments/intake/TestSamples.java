@@ -27,6 +27,9 @@ public final class TestSamples {
     public static final String AN_REINTENTO = "andina-co/samples/03-transaccion-aprobada-reintento.json";
     public static final String AN_REVERSADA = "andina-co/samples/04-transaccion-reversada.json";
 
+    public static final String AU_CONFIRMED = "austral-cl/samples/01-payment-confirmed.json";
+    public static final String AU_REVERSED = "austral-cl/samples/02-payment-reversed.json";
+
     private TestSamples() {
     }
 

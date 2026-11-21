@@ -48,6 +48,13 @@ class CanonicalEventContractTest {
         assertSatisfiesContract(new AndinaCanonicalEventMapper().map(request(Provider.ANDINA, sample), RECEIVED_AT));
     }
 
+    /** Chile is a product extension; the event contract was written for all three countries. */
+    @ParameterizedTest
+    @ValueSource(strings = {TestSamples.AU_CONFIRMED, TestSamples.AU_REVERSED})
+    void australSamplesProduceEventsTheContractAccepts(String sample) {
+        assertSatisfiesContract(new AustralCanonicalEventMapper().map(request(Provider.AUSTRAL, sample), RECEIVED_AT));
+    }
+
     @Test
     void theEventIsClosedAndCarriesThePinnedVersion() {
         CanonicalEvent event = new QuetzalCanonicalEventMapper()

@@ -4,12 +4,14 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.meridian.payments.intake.NotificationIntake;
 import com.meridian.payments.intake.auth.AndinaSignatureVerifier;
+import com.meridian.payments.intake.auth.AustralSignatureVerifier;
 import com.meridian.payments.intake.auth.Fixtures;
 import com.meridian.payments.intake.auth.Provider;
 import com.meridian.payments.intake.auth.QuetzalSignatureVerifier;
 import com.meridian.payments.intake.auth.SignatureVerification;
 import com.meridian.payments.intake.auth.SignatureVerifier;
 import com.meridian.payments.intake.canonical.AndinaCanonicalEventMapper;
+import com.meridian.payments.intake.canonical.AustralCanonicalEventMapper;
 import com.meridian.payments.intake.canonical.CanonicalEventMapper;
 import com.meridian.payments.intake.canonical.QuetzalCanonicalEventMapper;
 import com.meridian.payments.intake.store.InMemoryIntakeStore;
@@ -40,6 +42,8 @@ class WebhookEndpointTest {
     private static final String ANDINA_PATH = "/webhooks/co/andina";
     private static final Instant QUETZAL_NOW = Instant.ofEpochSecond(1_795_888_803L);
     private static final Instant ANDINA_NOW = Instant.parse("2026-11-28T19:05:00Z");
+    /** Austral signs nothing time-bound, so any instant serves; this one is the sample's send time. */
+    private static final Instant AUSTRAL_NOW = Instant.parse("2026-11-28T17:05:45Z");
     private static final ObjectMapper JSON = new ObjectMapper();
 
     private final InMemoryIntakeStore store = new InMemoryIntakeStore();
@@ -141,28 +145,82 @@ class WebhookEndpointTest {
     @Test
     void aPathThatIsNotPublishedIsA404() {
         HttpResponse response = endpoint(QUETZAL_NOW)
-                .handle(new HttpRequest("/webhooks/cl/austral", Map.of(), new byte[0]));
+                .handle(new HttpRequest("/webhooks/br/austral", Map.of(), new byte[0]));
 
         assertEquals(404, response.status());
+    }
+
+    @Test
+    void anAustralNotificationIsAcceptedAndAnsweredWithAReceipt() {
+        HttpRequest request = new HttpRequest("/webhooks/cl/austral",
+                Map.of("X-Austral-Signature", Fixtures.AUSTRAL_VECTORS.get(0).signature()),
+                Fixtures.sample(Fixtures.AU_CONFIRMED));
+
+        HttpResponse response = endpoint(AUSTRAL_NOW).handle(request);
+
+        assertEquals(200, response.status());
+        assertEquals("ACCEPTED", body(response).get("status").asText());
+        assertEquals(1, store.eventCount());
+        assertEquals(2, store.outboxJobs().size());
+    }
+
+    @Test
+    void anAustralDuplicateIsAReceiptAndNotTheAndina204() {
+        HttpRequest request = new HttpRequest("/webhooks/cl/austral",
+                Map.of("X-Austral-Signature", Fixtures.AUSTRAL_VECTORS.get(0).signature()),
+                Fixtures.sample(Fixtures.AU_CONFIRMED));
+        WebhookEndpoint endpoint = endpoint(AUSTRAL_NOW);
+
+        endpoint.handle(request);
+        HttpResponse duplicate = endpoint.handle(request);
+
+        assertEquals(200, duplicate.status(),
+                "this provider expects any 2xx, and the receipt is the same shape as the first one");
+        assertEquals("DUPLICATE", body(duplicate).get("status").asText());
+    }
+
+    @Test
+    void anAustralSignatureThatDoesNotMatchIsA401() {
+        HttpRequest request = new HttpRequest("/webhooks/cl/austral",
+                Map.of("X-Austral-Signature", "0".repeat(64)),
+                Fixtures.sample(Fixtures.AU_CONFIRMED));
+
+        HttpResponse response = endpoint(AUSTRAL_NOW).handle(request);
+
+        assertEquals(401, response.status());
+        assertEquals("SIGNATURE_INVALID", errorCode(response));
+        assertEquals(0, store.eventCount());
     }
 
     private WebhookEndpoint endpoint(Instant now) {
         Clock clock = Clock.fixed(now, ZoneOffset.UTC);
         return endpoint(now,
                 new QuetzalSignatureVerifier(Fixtures.SECRETS, clock),
-                new AndinaSignatureVerifier(Fixtures.SECRETS, clock));
+                new AndinaSignatureVerifier(Fixtures.SECRETS, clock),
+                new AustralSignatureVerifier(Fixtures.SECRETS));
     }
 
-    private WebhookEndpoint endpoint(Instant now, SignatureVerifier quetzal, SignatureVerifier andina) {
+    private WebhookEndpoint endpoint(
+            Instant now, SignatureVerifier quetzal, SignatureVerifier andina) {
+        return endpoint(now, quetzal, andina, new AustralSignatureVerifier(Fixtures.SECRETS));
+    }
+
+    private WebhookEndpoint endpoint(
+            Instant now, SignatureVerifier quetzal, SignatureVerifier andina, SignatureVerifier austral) {
         return new WebhookEndpoint(new NotificationIntake(
-                Map.of(Provider.QUETZAL, quetzal, Provider.ANDINA, andina),
+                Map.of(Provider.QUETZAL, quetzal,
+                        Provider.ANDINA, andina,
+                        Provider.AUSTRAL, austral),
                 mappers(),
                 store,
                 Clock.fixed(now, ZoneOffset.UTC)));
     }
 
     private static List<CanonicalEventMapper> mappers() {
-        return List.of(new QuetzalCanonicalEventMapper(), new AndinaCanonicalEventMapper());
+        return List.of(
+                new QuetzalCanonicalEventMapper(),
+                new AndinaCanonicalEventMapper(),
+                new AustralCanonicalEventMapper());
     }
 
     private static SignatureVerifier alwaysAuthentic() {

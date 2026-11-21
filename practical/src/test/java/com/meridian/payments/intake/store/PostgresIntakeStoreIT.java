@@ -30,6 +30,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
@@ -269,7 +270,10 @@ class PostgresIntakeStoreIT {
         PendingJob stale = store.claim(
                 Destination.CANONICAL_EVENT, 1, "worker-a", Duration.ofSeconds(1)).get(0);
 
-        Thread.sleep(1_200);
+        // Wait for the database to say the lease is dead. "Sleep a bit more than a second" is the same
+        // wall-clock assumption that made a publisher test fail on a loaded runner: the JVM and the
+        // database are not required to agree on what time it is, and the row is the source of truth.
+        awaitLeaseExpiry("evt-lease");
 
         PendingJob current = store.claim(
                 Destination.CANONICAL_EVENT, 1, "worker-b", Duration.ofSeconds(30)).get(0);
@@ -385,6 +389,21 @@ class PostgresIntakeStoreIT {
                 assertEquals(eventId, rows.getString("latest_event_id"));
                 assertEquals(observed, rows.getInt("observed_events"));
             }
+        }
+    }
+
+    /** Blocks until the database itself reports the claim lease as expired. */
+    private static void awaitLeaseExpiry(String eventId) throws SQLException, InterruptedException {
+        Instant deadline = Instant.now().plusSeconds(15);
+        String expired = "SELECT count(*) FROM outbox_job o "
+                + "JOIN payment_event e ON e.intake_id = o.intake_id "
+                + "WHERE e.event_id = '" + eventId + "' "
+                + "AND o.state = 'CLAIMED' AND o.claim_expires_at <= now()";
+        while (count(expired) == 0) {
+            if (Instant.now().isAfter(deadline)) {
+                fail("the lease on " + eventId + " never expired");
+            }
+            Thread.sleep(100);
         }
     }
 

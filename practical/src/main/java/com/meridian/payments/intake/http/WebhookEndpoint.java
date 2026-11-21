@@ -32,7 +32,8 @@ public final class WebhookEndpoint {
 
     private static final Map<String, Provider> ROUTES = Map.of(
             "/webhooks/mx/quetzal", Provider.QUETZAL,
-            "/webhooks/co/andina", Provider.ANDINA);
+            "/webhooks/co/andina", Provider.ANDINA,
+            "/webhooks/cl/austral", Provider.AUSTRAL);
 
     private static final String SIGNATURE_MESSAGE = "The request signature could not be verified.";
     private static final String STORE_MESSAGE = "The notification could not be accepted. Retry.";

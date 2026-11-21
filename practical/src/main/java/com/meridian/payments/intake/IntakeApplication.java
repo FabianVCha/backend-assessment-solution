@@ -1,11 +1,13 @@
 package com.meridian.payments.intake;
 
 import com.meridian.payments.intake.auth.AndinaSignatureVerifier;
+import com.meridian.payments.intake.auth.AustralSignatureVerifier;
 import com.meridian.payments.intake.auth.InMemorySecretProvider;
 import com.meridian.payments.intake.auth.Provider;
 import com.meridian.payments.intake.auth.QuetzalSignatureVerifier;
 import com.meridian.payments.intake.auth.SecretProvider;
 import com.meridian.payments.intake.canonical.AndinaCanonicalEventMapper;
+import com.meridian.payments.intake.canonical.AustralCanonicalEventMapper;
 import com.meridian.payments.intake.canonical.CanonicalEventMapper;
 import com.meridian.payments.intake.canonical.QuetzalCanonicalEventMapper;
 import com.meridian.payments.intake.http.IntakeServer;
@@ -50,7 +52,8 @@ public final class IntakeApplication {
         int port = Integer.parseInt(environment("PORT", "8080"));
         SecretProvider secrets = new InMemorySecretProvider(Map.of(
                 Provider.QUETZAL, required("QUETZAL_WEBHOOK_SECRET").getBytes(StandardCharsets.UTF_8),
-                Provider.ANDINA, required("ANDINA_WEBHOOK_SECRET").getBytes(StandardCharsets.UTF_8)));
+                Provider.ANDINA, required("ANDINA_WEBHOOK_SECRET").getBytes(StandardCharsets.UTF_8),
+                Provider.AUSTRAL, required("AUSTRAL_WEBHOOK_SECRET").getBytes(StandardCharsets.UTF_8)));
 
         Clock clock = Clock.systemUTC();
         String jdbcUrl = environment("INTAKE_JDBC_URL", "");
@@ -80,12 +83,15 @@ public final class IntakeApplication {
         }
         Broker broker = message -> LOG.info("published message " + message.messageId());
         List<CanonicalEventMapper> mappers = List.of(
-                new QuetzalCanonicalEventMapper(), new AndinaCanonicalEventMapper());
+                new QuetzalCanonicalEventMapper(),
+                new AndinaCanonicalEventMapper(),
+                new AustralCanonicalEventMapper());
 
         NotificationIntake intake = new NotificationIntake(
                 Map.of(
                         Provider.QUETZAL, new QuetzalSignatureVerifier(secrets, clock),
-                        Provider.ANDINA, new AndinaSignatureVerifier(secrets, clock)),
+                        Provider.ANDINA, new AndinaSignatureVerifier(secrets, clock),
+                        Provider.AUSTRAL, new AustralSignatureVerifier(secrets)),
                 mappers,
                 intakeStore,
                 clock);

@@ -32,6 +32,7 @@ final class Payloads {
 
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final Pattern MAJOR_UNITS = Pattern.compile("^([0-9]{1,13})[.]([0-9]{2})$");
+    private static final Pattern INTEGER_UNITS = Pattern.compile("^[0-9]{1,13}$");
 
     private Payloads() {
     }
@@ -131,6 +132,24 @@ final class Payloads {
                     "`reference` is not a " + country + " policy number");
         }
         return reference.toUpperCase(Locale.ROOT);
+    }
+
+    /**
+     * Reads an amount that arrives as an integer string in a currency with no minor unit.
+     *
+     * <p>CLP has exponent 0: "45990" is CLP 45,990, and {@code amount_minor} is 45990 with
+     * {@code currency_exponent} 0. Multiplying by a hundred here would turn a 45,990 payment into a
+     * 4,599,000 one, which is the kind of error a payment system does not get to make twice.
+     */
+    static long integerAmountInMajorUnits(String value, String field) {
+        if (!INTEGER_UNITS.matcher(value).matches()) {
+            throw failure(Failure.SCHEMA_VALIDATION_FAILED, "`" + field + "` is not an integer amount");
+        }
+        try {
+            return withinRange(Long.parseLong(value), 1, MAXIMUM_AMOUNT_MINOR, "`" + field + "`");
+        } catch (NumberFormatException e) {
+            throw failure(Failure.SCHEMA_VALIDATION_FAILED, "`" + field + "` is outside the contract range");
+        }
     }
 
     static String sha256Hex(byte[] bytes) {

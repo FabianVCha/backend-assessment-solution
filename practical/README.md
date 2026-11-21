@@ -279,7 +279,7 @@ costs a poll rather than a payment.
 
 ## Implemented: HTTP surface
 
-`http.WebhookEndpoint` is the handler for the two paths the contract publishes, and it decides nothing
+`http.WebhookEndpoint` is the handler for the three paths the contract publishes, and it decides nothing
 the contract has not decided:
 
 | Situation | Answer |
@@ -289,8 +289,12 @@ the contract has not decided:
 | authentic but unusable payload | `400` with `MALFORMED_JSON`, `SCHEMA_VALIDATION_FAILED` or `POLICY_REFERENCE_UNPARSEABLE` |
 | store could not commit | `503` `STORE_UNAVAILABLE` with `Retry-After: 5` |
 | first acceptance | `200` `{"status":"ACCEPTED"}` |
-| duplicate | Quetzal: `200` `{"status":"DUPLICATE"}`; Andina: `204` with no body |
+| duplicate | Quetzal and Austral: `200` `{"status":"DUPLICATE"}`; Andina: `204` with no body |
 | any other path | `404` |
+
+The paths are `/webhooks/mx/quetzal`, `/webhooks/co/andina` and `/webhooks/cl/austral`. The last one is
+a product extension: the original exercise covered Mexico and Colombia, and Chile reuses the same
+pipeline with its own adapter — one verifier, one mapper, one route, no fork of the flow.
 
 Two deliberate omissions: no `202` on any path, because the `2xx` is a durability fact and not an
 intent; and no content-type gate, because the contract declares a JSON body and its error vocabulary
@@ -334,7 +338,7 @@ store is no longer one of them.
 
 ## Tests and evidence
 
-146 JUnit 5 tests: 129 need nothing but a JVM, and 17 more run against a real PostgreSQL when
+175 JUnit 5 tests: 158 need nothing but a JVM, and 17 more run against a real PostgreSQL when
 `INTAKE_IT_JDBC_URL` is set (CI sets it, so they are a gate and not a local habit).
 
 Authentication (51):
