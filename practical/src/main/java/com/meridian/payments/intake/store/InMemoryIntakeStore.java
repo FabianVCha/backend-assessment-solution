@@ -29,9 +29,6 @@ import java.util.Objects;
  */
 public final class InMemoryIntakeStore implements IntakeStore, OutboxStore {
 
-    /** Longest wait between attempts; the design asks for backoff, not for an infinite curve. */
-    private static final Duration MAXIMUM_BACKOFF = Duration.ofSeconds(60);
-
     private record EventKey(Provider provider, String eventId) {
     }
 
@@ -174,9 +171,7 @@ public final class InMemoryIntakeStore implements IntakeStore, OutboxStore {
     }
 
     private static Duration backoff(int attempts) {
-        long seconds = 1L << Math.min(attempts - 1, 6);
-        Duration candidate = Duration.ofSeconds(seconds);
-        return candidate.compareTo(MAXIMUM_BACKOFF) > 0 ? MAXIMUM_BACKOFF : candidate;
+        return RetrySchedule.after(attempts);
     }
 
     private JobState state(PendingJob job) {

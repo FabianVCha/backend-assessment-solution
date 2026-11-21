@@ -65,6 +65,7 @@ practical/
       Hmac.java                      HMAC-SHA256 and constant-time compare
     canonical/
       CanonicalEvent.java            the event record and its JSON form
+      CanonicalEvents.java           reads the stored document back, field by field
       CanonicalEventMapper.java      mapping boundary
       CanonicalMappingException.java the codes the error contract declares
       Payloads.java                  field reading rules shared by both mappers
@@ -73,7 +74,10 @@ practical/
     store/
       IntakeStore.java               persistence boundary
       OutboxStore.java               outbox drained per destination, with a retry schedule
-      InMemoryIntakeStore.java       in-memory inbox and outbox, one transaction
+      PostgresIntakeStore.java       the durable inbox and outbox, one transaction and one constraint
+      Database.java                  bounded pool and the migration run, before the first query
+      RetrySchedule.java             the retry curve, stated once
+      InMemoryIntakeStore.java       in-memory double of the same rules, for the demo
       Acceptance.java                ACCEPTED or DUPLICATE
       OutboxJob.java                 one unit of work per destination
       PendingJob.java                a job with the event it carries
@@ -87,12 +91,15 @@ practical/
       CanonicalMessage.java          message id, correlation id and body
       MessageIds.java                the derived, stable message id
       BrokerUnavailableException.java the ack never came
+  src/main/resources/db/migration/
+    V1__intake.sql                   the inbox, the outbox and their indexes
   src/test/java/com/meridian/payments/intake/
     TestSamples.java                 published samples and the schema path
     MutableClock.java                a clock the tests move by hand
     NotificationIntakeTest.java      the whole path with the real pieces
     auth/                            signature tests
     store/InMemoryIntakeStoreTest.java
+    store/PostgresIntakeStoreIT.java  the same rules against a real database, skipped without one
     publish/CanonicalEventPublisherTest.java
     publish/PublisherLoopTest.java
     http/WebhookEndpointTest.java
@@ -171,8 +178,9 @@ promises: verify the signature, build the event, then write it. Verification com
 body never reaches the JSON reader, and an authentic body is never rejected for a reason that belongs
 to the parser.
 
-`store.IntakeStore` states the contract the design relies on, and `InMemoryIntakeStore` reproduces it
-without a database:
+`store.IntakeStore` states the contract the design relies on. Two implementations satisfy it: the
+durable `PostgresIntakeStore` the process runs, and `InMemoryIntakeStore`, which reproduces the same
+rules in memory for the demo:
 
 - `(provider, event_id)` is unique. A second delivery is `DUPLICATE`: a 2xx with no new event and no
   new outbox job. It is not an error.
@@ -184,6 +192,26 @@ The in-memory transaction stages into copies and publishes them only after every
 succeeded. That is what lets the injected failures prove the atomicity claim: the tests make the
 store fail before the transaction and in the middle of it, and assert that nothing survives either
 time.
+
+### The durable store
+
+`store.PostgresIntakeStore` puts the same contract in the database, where the decision stops being the
+application's:
+
+- the insert is `INSERT ... ON CONFLICT (provider, event_id) DO NOTHING`. A row count of zero means the
+  other delivery committed first, so there is no window between a check and a write. Eight replicas
+  sending the same event at the same instant produce one event and two jobs, and the integration test
+  asserts exactly that;
+- the event and both jobs are one transaction. A trigger that rejects the second job makes the whole
+  accept fail, and the test then counts zero events and zero jobs;
+- `store.Database` runs Flyway before the first query, so a migration that fails stops the process
+  instead of leaving it running against a schema it does not know;
+- the publisher reads the stored document back, and a round-trip test uses the provider samples rather
+  than a hand-built event. That is not decoration: the first version of the reader treated
+  `refunded_amount_semantics` as mandatory, and the real Quetzal sample — where it is null — stopped
+  publishing in the running container while the hand-built fixture passed;
+- the retry curve exists twice, in `RetrySchedule` and in the SQL that schedules the row. One
+  integration test pins them together: one failure schedules a second, the next two, then four.
 
 ## Implemented: publication to the canonical topic (FR6)
 
@@ -231,27 +259,44 @@ has no code for an unsupported media type, so inventing one would break the cont
 
 ## Running it
 
-The image is buildable and was exercised. What a container answered, with a body signed the way the
-provider signs it:
+Two profiles. The durable one needs nothing but Docker:
 
 ```sh
-docker build -t premium-payment-intake:local practical
+docker compose up --build
+```
+
+That starts PostgreSQL 16 and the intake on `127.0.0.1:8080`; the migrations run at startup. Against
+it, with a body signed the way the provider signs it:
+
+- first delivery: `200 {"status":"ACCEPTED"}`, and the database holds one `payment_event` and two
+  `outbox_job` rows;
+- the same body again: `200 {"status":"DUPLICATE"}`, and the counts do not change;
+- a tampered signature: `401 {"error":{"code":"SIGNATURE_INVALID",...}}`;
+- ten seconds later the `CANONICAL_EVENT` job is `PUBLISHED` and the `SALESFORCE` job is still
+  `PENDING`: the two lanes drain independently.
+
+The sandbox vectors and the signature scheme are in `../reference/providers/*/WEBHOOK_SPEC.md`.
+
+The in-memory profile exists for the demo and has to be asked for by name:
+
+```sh
 docker run --rm -p 8080:8080 \
+  -e INTAKE_ALLOW_IN_MEMORY_STORE=true \
   -e QUETZAL_WEBHOOK_SECRET=<sandbox vector> \
   -e ANDINA_WEBHOOK_SECRET=<sandbox vector> \
   premium-payment-intake:local
 ```
 
-- first delivery: `200 {"status":"ACCEPTED"}`
-- the same body again: `200 {"status":"DUPLICATE"}`
-- a tampered signature: `401 {"error":{"code":"SIGNATURE_INVALID",...}}`
+Without `INTAKE_JDBC_URL` and without that flag the process refuses to start. A deployment that forgot
+the database must fail loudly, not accept payments into a store that loses them on restart.
 
-Three adapters are in-memory in this process: the store, the broker and the secret source (the
-environment). Everything between them is the tested implementation.
+The broker and the secret source are still adapters: the recording broker and the environment. The
+store is no longer one of them.
 
 ## Tests and evidence
 
-122 JUnit 5 tests.
+134 JUnit 5 tests: 125 need nothing but a JVM, and 9 more run against a real PostgreSQL when
+`INTAKE_IT_JDBC_URL` is set (CI sets it, so they are a gate and not a local habit).
 
 Authentication (51):
 
@@ -273,7 +318,21 @@ Canonical mapping (40):
 - failures: malformed JSON, non-object JSON, a missing event id, an unknown charge type, an unknown
   state, an unmappable policy reference, a currency that is not the provider's, three decimals, a
   zero amount, a missing `notificacion_id`, and a mapper handed the other provider's document;
-- the serialised event carries no payer data and no provider notification id.
+- the serialised event carries no payer data and no provider notification id;
+- the stored document round-trips back to the same event for a captured charge (where the refund
+  semantics are null), a refunded charge, and a Colombian reversal.
+
+PostgreSQL store (9, skipped without a database):
+
+- one accept writes one event and two jobs, counted in the tables;
+- a second delivery is `DUPLICATE` and the counts do not move;
+- the same event id under another provider is another event;
+- eight replicas delivering the same event at once commit exactly one event and two jobs;
+- a trigger that rejects the second job leaves zero events and zero jobs, and the accept fails;
+- the canonical publisher drains its lane and leaves the Salesforce job pending;
+- what the publisher reads equals what was accepted;
+- the scheduled retry follows `RetrySchedule`: one second, then two, then four;
+- the schema in the database was applied by a recorded migration.
 
 Store and intake (12):
 
@@ -326,8 +385,8 @@ no red-phase capture; their evidence is the full suite green plus the injected f
 ## Stubbed
 
 - Secrets: in-memory provider; the design reads Azure Key Vault.
-- Store: in-memory implementation behind `IntakeStore` and `OutboxStore`; the design puts PostgreSQL
-  behind them, with the same unique constraint, the same transaction boundary and `next_attempt_at`.
+- Store: PostgreSQL, in the process. `InMemoryIntakeStore` survives as the named demo profile, not as
+  the default path.
 - Broker: recording implementation behind `Broker`; the design puts Azure Service Bus behind it.
 - Salesforce: not called anywhere. The `SALESFORCE` job is recorded for a relay that is out of scope
   for this part, as the task states.
@@ -337,11 +396,17 @@ no red-phase capture; their evidence is the full suite green plus the injected f
 - Secrets come from the environment in the runnable image. `SecretProvider` is the boundary the design
   fixes; the Key Vault adapter is the piece still missing, even though the vault and the role
   assignment exist in `infra/`.
-- The process runs with the in-memory store and the recording broker, so two replicas would not share
-  state. That is a property of the stubs, not of the interfaces.
+- The process runs with the recording broker, so a published message goes to a log line. The store is
+  durable; the next hop is not yet.
+- No claim or lease on the outbox row. One process does not need it; two replicas polling the same
+  table would publish the same message twice, which the consumer's deduplication covers but which is
+  waste and hides a real defect. This is the next slice.
+- The pool is one size for the whole process (eight connections). Per-role pools belong with the
+  process split into roles.
 - No dead-letter rule: a publication that keeps failing retries forever with a sixty-second cap. Part
   A's design puts the dead letter on the broker and on the relay; here the job simply stays pending.
-- No claim or lease on the outbox row, which one process does not need and two would.
+- No crash-and-restart transcript in this change: the schema and the transaction survive a restart, and
+  the evidence for it is the next slice.
 - No relay to Salesforce: the `SALESFORCE` job is recorded and never processed, so no batching, no
   backoff and no dead letter on that path.
 - Content-type is not gated, on purpose: the contract declares a JSON body and its error enum has no

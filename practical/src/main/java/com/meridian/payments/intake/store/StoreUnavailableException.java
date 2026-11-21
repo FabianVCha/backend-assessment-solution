@@ -11,4 +11,9 @@ public final class StoreUnavailableException extends RuntimeException {
     public StoreUnavailableException(String message) {
         super(message);
     }
+
+    /** Keeps the driver's reason attached: a client sees the 503, the operator sees the cause. */
+    public StoreUnavailableException(String message, Throwable cause) {
+        super(message, cause);
+    }
 }

@@ -16,6 +16,9 @@
     <junit.version>5.11.4</junit.version>
     <jackson.version>2.18.12</jackson.version>
     <json-schema-validator.version>2.0.8</json-schema-validator.version>
+    <postgresql.version>42.7.14</postgresql.version>
+    <hikari.version>7.1.0</hikari.version>
+    <flyway.version>13.13.0</flyway.version>
   </properties>
 
   <dependencies>
@@ -23,6 +26,28 @@
       <groupId>com.fasterxml.jackson.core</groupId>
       <artifactId>jackson-databind</artifactId>
       <version>${jackson.version}</version>
+    </dependency>
+    <!-- The durable store. The driver, the bounded pool and the migration runner are the only
+         runtime dependencies the process adds; the HTTP side is still the JDK. -->
+    <dependency>
+      <groupId>org.postgresql</groupId>
+      <artifactId>postgresql</artifactId>
+      <version>${postgresql.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.zaxxer</groupId>
+      <artifactId>HikariCP</artifactId>
+      <version>${hikari.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.flywaydb</groupId>
+      <artifactId>flyway-core</artifactId>
+      <version>${flyway.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.flywaydb</groupId>
+      <artifactId>flyway-database-postgresql</artifactId>
+      <version>${flyway.version}</version>
     </dependency>
     <dependency>
       <groupId>org.junit.jupiter</groupId>
@@ -50,6 +75,15 @@
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-surefire-plugin</artifactId>
         <version>3.5.2</version>
+        <configuration>
+          <!-- The database tests are named *IT and skip themselves when INTAKE_IT_JDBC_URL is absent.
+               Listing them here keeps one command and one report: a separate profile would be a second
+               way to run the suite, and the one CI uses must be the one a reviewer can repeat. -->
+          <includes>
+            <include>**/*Test.java</include>
+            <include>**/*IT.java</include>
+          </includes>
+        </configuration>
       </plugin>
       <!-- One runnable jar with Jackson inside: the runtime image has a JRE and nothing else. -->
       <plugin>
@@ -68,6 +102,10 @@
                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
                   <mainClass>com.meridian.payments.intake.IntakeApplication</mainClass>
                 </transformer>
+                <!-- Flyway discovers its database plugin through ServiceLoader. The shade plugin keeps
+                     only the last META-INF/services file it sees unless this transformer merges them,
+                     and the jar then starts without a migration runner. -->
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
               </transformers>
             </configuration>
           </execution>
