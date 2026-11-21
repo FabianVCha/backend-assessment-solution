@@ -1,0 +1,84 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  java:
+    name: build and test (Java 21)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      # The suite is the only proof that FR1, FR2, FR4 and NFR3 still hold, and it validates every
+      # produced event against the published schema, so a contract drift fails here.
+      - run: mvn -B -ntp -f practical/pom.xml test
+      - name: test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: practical/target/surefire-reports
+          if-no-files-found: ignore
+
+  contracts:
+    name: contracts are a valid document
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      # Pinned: a lint run that changes with `latest` is not a gate. The JSON Schema is validated by
+      # the Java suite, which is where the events that must satisfy it are produced.
+      - run: npx --yes @redocly/cli@1.34.5 lint docs/api/webhooks.openapi.yaml
+
+  infra:
+    name: infrastructure compiles
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/cli@v2
+        with:
+          # No login: bicep build is a compiler, not an ARM call. That is why this gate runs on a
+          # pull request from a fork without any credential.
+          inlineScript: |
+            az bicep build --file infra/main.bicep --stdout > /dev/null
+            for environment in dev test prod; do
+              az bicep build-params --file "infra/params/$environment.bicepparam" --stdout > /dev/null
+            done
+
+  security:
+    name: secrets and image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # The repository is public: a leaked credential cannot be un-leaked by a later commit, so the
+      # scan runs on the whole history, not only on the diff.
+      - uses: gitleaks/gitleaks-action@v2.3.9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: build the image the pipeline would deploy
+        run: docker build -t premium-payment-intake:ci practical
+      - uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: premium-payment-intake:ci
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '1'
