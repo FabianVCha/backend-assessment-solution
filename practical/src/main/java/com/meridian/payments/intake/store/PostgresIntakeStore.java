@@ -121,6 +121,28 @@ public final class PostgresIntakeStore implements IntakeStore, OutboxStore {
               AND o.claim_token = CAST(? AS uuid)
             """;
 
+    private static final String UPSERT_PAYMENT_STATE = """
+            INSERT INTO payment_state (
+                payment_key, provider, country, latest_status, latest_event_id,
+                latest_status_changed_at, latest_received_at, observed_events)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+            ON CONFLICT (payment_key) DO UPDATE
+            SET observed_events = payment_state.observed_events + 1,
+                updated_at = now(),
+                latest_status = CASE
+                    WHEN EXCLUDED.latest_status_changed_at >= payment_state.latest_status_changed_at
+                    THEN EXCLUDED.latest_status ELSE payment_state.latest_status END,
+                latest_event_id = CASE
+                    WHEN EXCLUDED.latest_status_changed_at >= payment_state.latest_status_changed_at
+                    THEN EXCLUDED.latest_event_id ELSE payment_state.latest_event_id END,
+                latest_status_changed_at = CASE
+                    WHEN EXCLUDED.latest_status_changed_at >= payment_state.latest_status_changed_at
+                    THEN EXCLUDED.latest_status_changed_at ELSE payment_state.latest_status_changed_at END,
+                latest_received_at = CASE
+                    WHEN EXCLUDED.latest_status_changed_at >= payment_state.latest_status_changed_at
+                    THEN EXCLUDED.latest_received_at ELSE payment_state.latest_received_at END
+            """;
+
     private final Database database;
     private final Clock clock;
     private static final ObjectMapper JSON = new ObjectMapper();
@@ -148,6 +170,9 @@ public final class PostgresIntakeStore implements IntakeStore, OutboxStore {
                 }
                 insertJob(connection, intakeId, Destination.CANONICAL_EVENT);
                 insertJob(connection, intakeId, Destination.SALESFORCE);
+                // The projection moves with the fact it summarises: if this transaction rolls back, the
+                // operations view cannot claim a state the inbox does not hold.
+                upsertPaymentState(connection, event);
                 connection.commit();
                 return Acceptance.ACCEPTED;
             } catch (SQLException e) {
@@ -351,6 +376,27 @@ public final class PostgresIntakeStore implements IntakeStore, OutboxStore {
             statement.setObject(1, intakeId);
             statement.setString(2, destination.name());
             statement.setObject(3, at(clock.instant()));
+            statement.executeUpdate();
+        }
+    }
+
+    /**
+     * Keeps the payment projection in step with the event that was just accepted.
+     *
+     * <p>The status only moves when the provider's own timestamp is not older than what the row holds.
+     * A capture that arrives late therefore cannot undo a reversal: the newest fact by the provider's
+     * clock wins, and arrival order decides nothing. The counter of observed events moves on every
+     * accepted notification, because a notification that changed no status is still a fact.
+     */
+    private void upsertPaymentState(Connection connection, CanonicalEvent event) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement(UPSERT_PAYMENT_STATE)) {
+            statement.setString(1, event.paymentKey());
+            statement.setString(2, event.provider().name());
+            statement.setString(3, event.country());
+            statement.setString(4, event.status());
+            statement.setString(5, event.eventId());
+            statement.setObject(6, at(event.statusChangedAt()));
+            statement.setObject(7, at(event.receivedAt()));
             statement.executeUpdate();
         }
     }

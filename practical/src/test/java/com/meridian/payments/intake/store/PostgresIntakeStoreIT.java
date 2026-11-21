@@ -72,6 +72,7 @@ class PostgresIntakeStoreIT {
         store = new PostgresIntakeStore(database);
         execute("DELETE FROM outbox_job");
         execute("DELETE FROM payment_event");
+        execute("DELETE FROM payment_state");
     }
 
     @Test
@@ -312,24 +313,105 @@ class PostgresIntakeStoreIT {
         assertEquals(2, sent.stream().map(CanonicalMessage::messageId).distinct().count());
     }
 
+    /** The projection answers "where is this payment", so it survives an older notification arriving late. */
+    @Test
+    void theProjectionKeepsTheNewestStatusByTheProviderClock() throws SQLException {
+        store.accept(event(Provider.QUETZAL, "evt-capture", "PAY-9", "CAPTURED",
+                Instant.parse("2026-12-01T10:00:00Z")));
+        store.accept(event(Provider.QUETZAL, "evt-reversal", "PAY-9", "REVERSED",
+                Instant.parse("2026-12-01T11:00:00Z")));
+
+        assertProjection("PAY-9", "REVERSED", "evt-reversal", 2);
+    }
+
+    @Test
+    void aDelayedCaptureDoesNotReplaceANewerReversal() throws SQLException {
+        store.accept(event(Provider.QUETZAL, "evt-reversal", "PAY-9", "REVERSED",
+                Instant.parse("2026-12-01T11:00:00Z")));
+        store.accept(event(Provider.QUETZAL, "evt-late-capture", "PAY-9", "CAPTURED",
+                Instant.parse("2026-12-01T10:30:00Z")));
+
+        assertProjection("PAY-9", "REVERSED", "evt-reversal", 2);
+    }
+
+    @Test
+    void aDuplicateIsCountedOnce() throws SQLException {
+        CanonicalEvent event = event(Provider.QUETZAL, "evt-dup-state", "PAY-9", "CAPTURED",
+                Instant.parse("2026-12-01T10:00:00Z"));
+        store.accept(event);
+        store.accept(event);
+
+        assertProjection("PAY-9", "CAPTURED", "evt-dup-state", 1);
+    }
+
+    @Test
+    void aRolledBackAcceptLeavesNoProjection() throws SQLException {
+        execute("""
+                CREATE OR REPLACE FUNCTION reject_salesforce_job() RETURNS trigger AS $$
+                BEGIN
+                    IF NEW.destination = 'SALESFORCE' THEN
+                        RAISE EXCEPTION 'injected failure while writing the second job';
+                    END IF;
+                    RETURN NEW;
+                END
+                $$ LANGUAGE plpgsql
+                """);
+        execute("""
+                CREATE TRIGGER outbox_job_reject BEFORE INSERT ON outbox_job
+                FOR EACH ROW EXECUTE FUNCTION reject_salesforce_job()
+                """);
+        try {
+            assertThrows(StoreUnavailableException.class, () -> store.accept(
+                    event(Provider.QUETZAL, "evt-rollback-state", "PAY-9", "CAPTURED",
+                            Instant.parse("2026-12-01T10:00:00Z"))));
+        } finally {
+            execute("DROP TRIGGER outbox_job_reject ON outbox_job");
+            execute("DROP FUNCTION reject_salesforce_job()");
+        }
+
+        assertEquals(0, count("SELECT count(*) FROM payment_state"));
+    }
+
+    private static void assertProjection(
+            String paymentKey, String status, String eventId, int observed) throws SQLException {
+        try (Connection connection = database.connection();
+             var statement = connection.prepareStatement(
+                     "SELECT latest_status, latest_event_id, observed_events "
+                             + "FROM payment_state WHERE payment_key = ?")) {
+            statement.setString(1, paymentKey);
+            try (ResultSet rows = statement.executeQuery()) {
+                assertTrue(rows.next(), "the payment has a projection");
+                assertEquals(status, rows.getString("latest_status"));
+                assertEquals(eventId, rows.getString("latest_event_id"));
+                assertEquals(observed, rows.getInt("observed_events"));
+            }
+        }
+    }
+
     private static CanonicalEvent event(Provider provider, String eventId) {
+        return event(provider, eventId, "PAY-2026-0001", "CAPTURED",
+                Instant.parse("2026-12-01T10:00:00Z"));
+    }
+
+    private static CanonicalEvent event(
+            Provider provider, String eventId, String paymentKey, String status, Instant statusChangedAt) {
         return new CanonicalEvent(
                 eventId,
                 provider,
                 provider == Provider.ANDINA ? "CO" : "MX",
-                "PAY-2026-0001",
+                paymentKey,
                 "TX-0001",
                 "POL-0001",
                 19900,
                 provider == Provider.ANDINA ? "COP" : "MXN",
                 2,
-                "CAPTURED",
+                status,
                 null,
                 // The real Quetzal sample reports no refund semantics: null is the fact, and the
                 // database round trip must carry it. The Colombian fixture exercises the filled shape.
                 provider == Provider.ANDINA ? "AMOUNT_AS_REPORTED" : null,
                 provider == Provider.ANDINA ? "FULL" : null,
-                Instant.parse("2026-12-01T10:00:00Z"),
+                statusChangedAt,
                 Instant.parse("2026-12-01T09:59:30Z"),
                 Instant.parse("2026-12-01T10:00:05Z"),
                 "corr-" + eventId,
