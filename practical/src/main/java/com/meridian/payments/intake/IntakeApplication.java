@@ -13,7 +13,11 @@ import com.meridian.payments.intake.http.WebhookEndpoint;
 import com.meridian.payments.intake.publish.Broker;
 import com.meridian.payments.intake.publish.CanonicalEventPublisher;
 import com.meridian.payments.intake.publish.PublisherLoop;
+import com.meridian.payments.intake.store.Database;
 import com.meridian.payments.intake.store.InMemoryIntakeStore;
+import com.meridian.payments.intake.store.IntakeStore;
+import com.meridian.payments.intake.store.OutboxStore;
+import com.meridian.payments.intake.store.PostgresIntakeStore;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -49,7 +53,31 @@ public final class IntakeApplication {
                 Provider.ANDINA, required("ANDINA_WEBHOOK_SECRET").getBytes(StandardCharsets.UTF_8)));
 
         Clock clock = Clock.systemUTC();
-        InMemoryIntakeStore store = new InMemoryIntakeStore(clock);
+        String jdbcUrl = environment("INTAKE_JDBC_URL", "");
+        Database database = null;
+        IntakeStore intakeStore;
+        OutboxStore outboxStore;
+        String store;
+        if (!jdbcUrl.isBlank()) {
+            database = Database.open(
+                    jdbcUrl,
+                    environment("INTAKE_DB_USER", "intake"),
+                    environment("INTAKE_DB_PASSWORD", ""));
+            PostgresIntakeStore postgres = new PostgresIntakeStore(database, clock);
+            intakeStore = postgres;
+            outboxStore = postgres;
+            store = "postgres";
+        } else if (Boolean.parseBoolean(environment("INTAKE_ALLOW_IN_MEMORY_STORE", "false"))) {
+            // An explicit opt-in, never a fallback: a deployment that forgot the URL must fail here
+            // and not accept payments into a store that loses them on restart.
+            InMemoryIntakeStore memory = new InMemoryIntakeStore(clock);
+            intakeStore = memory;
+            outboxStore = memory;
+            store = "in-memory, lost on restart";
+        } else {
+            throw new IllegalStateException(
+                    "INTAKE_JDBC_URL is required; INTAKE_ALLOW_IN_MEMORY_STORE=true runs the demo without a database");
+        }
         Broker broker = message -> LOG.info("published message " + message.messageId());
         List<CanonicalEventMapper> mappers = List.of(
                 new QuetzalCanonicalEventMapper(), new AndinaCanonicalEventMapper());
@@ -59,16 +87,20 @@ public final class IntakeApplication {
                         Provider.QUETZAL, new QuetzalSignatureVerifier(secrets, clock),
                         Provider.ANDINA, new AndinaSignatureVerifier(secrets, clock)),
                 mappers,
-                store,
+                intakeStore,
                 clock);
 
-        CanonicalEventPublisher publisher = new CanonicalEventPublisher(store, broker, 50);
+        CanonicalEventPublisher publisher = new CanonicalEventPublisher(outboxStore, broker, 50);
         try (PublisherLoop loop = new PublisherLoop(publisher, Duration.ofSeconds(10));
              IntakeServer server = IntakeServer.start(new WebhookEndpoint(intake), port)) {
             loop.start();
-            LOG.info("intake listening on port " + server.port() + " with in-memory store, "
+            LOG.info("intake listening on port " + server.port() + " with " + store + " store, "
                     + "recording broker and environment-provided secrets");
             Thread.currentThread().join();
+        } finally {
+            if (database != null) {
+                database.close();
+            }
         }
     }
 

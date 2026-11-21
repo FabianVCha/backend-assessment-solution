@@ -16,6 +16,22 @@ jobs:
   java:
     name: build and test (Java 21)
     runs-on: ubuntu-latest
+    # The durable store is only proven against a real database, so the database is part of the job that
+    # claims to prove it. The tests skip themselves when INTAKE_IT_JDBC_URL is absent; here it is set.
+    services:
+      postgres:
+        image: postgres:16.16-alpine
+        env:
+          POSTGRES_DB: intake
+          POSTGRES_USER: intake
+          POSTGRES_PASSWORD: local-demo-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U intake -d intake"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -26,6 +42,10 @@ jobs:
       # The suite is the only proof that FR1, FR2, FR4 and NFR3 still hold, and it validates every
       # produced event against the published schema, so a contract drift fails here.
       - run: mvn -B -ntp -f practical/pom.xml test
+        env:
+          INTAKE_IT_JDBC_URL: jdbc:postgresql://127.0.0.1:5432/intake
+          INTAKE_IT_DB_USER: intake
+          INTAKE_IT_DB_PASSWORD: local-demo-only
       - name: test reports
         if: always()
         uses: actions/upload-artifact@v4

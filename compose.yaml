@@ -1,0 +1,45 @@
+# Local profile: real PostgreSQL, the intake process, and nothing that needs a cloud credential.
+#
+# The two webhook secrets are the sandbox vectors published by the exercise in
+# reference/providers/*/WEBHOOK_SPEC.md. They are test material, not provider credentials.
+name: premium-payment-intake
+
+services:
+  database:
+    image: postgres:16.16-alpine
+    environment:
+      POSTGRES_DB: intake
+      POSTGRES_USER: intake
+      # A local-only password for a database bound to the loopback interface. Neither this value nor
+      # this account exists outside a developer machine; in Azure the app uses its managed identity.
+      POSTGRES_PASSWORD: local-demo-only
+    ports:
+      - "127.0.0.1:55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U intake -d intake"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - intake-data:/var/lib/postgresql/data
+
+  intake:
+    build: practical
+    depends_on:
+      database:
+        condition: service_healthy
+    environment:
+      PORT: "8080"
+      # Presence of this URL selects the durable store; omitting it makes the process refuse to start.
+      INTAKE_JDBC_URL: jdbc:postgresql://database:5432/intake
+      INTAKE_DB_USER: intake
+      INTAKE_DB_PASSWORD: local-demo-only
+      # The sandbox signing vectors published in reference/providers/*/WEBHOOK_SPEC.md. They are
+      # exercise fixtures, not provider credentials, and the marker says so to the secrets gate.
+      QUETZAL_WEBHOOK_SECRET: qz_test_whsec_4f8a1c2e9b7d # gitleaks:allow
+      ANDINA_WEBHOOK_SECRET: andina_test_secret_7c3e19ab # gitleaks:allow
+    ports:
+      - "127.0.0.1:8080:8080"
+
+volumes:
+  intake-data:
