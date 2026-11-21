@@ -24,9 +24,9 @@ Tick every item before you send your repository URL. Missing items are scored as
 - [x] `practical/README.md`
 
 ## Part C — Azure IaC and CI/CD
-- [ ] Bicep or Terraform in `infra/`, with `infra/README.md`
-- [ ] `docs/infra/AZURE_SERVICES.md`
-- [ ] Pipeline definition in `.github/workflows/` or `pipelines/`
+- [x] Bicep or Terraform in `infra/`, with `infra/README.md`
+- [x] `docs/infra/AZURE_SERVICES.md`
+- [x] Pipeline definition in `.github/workflows/` or `pipelines/`
 
 ## Part D — Operations
 - [ ] `docs/operations/OPERATIONS.md`
