@@ -10,6 +10,7 @@ import java.time.Instant;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
@@ -87,7 +88,8 @@ class InMemoryIntakeStoreTest {
         InMemoryIntakeStore scheduled = new InMemoryIntakeStore(clock);
         scheduled.accept(quetzal("evt_01"));
         OutboxJob job = new OutboxJob(Provider.QUETZAL, "evt_01", Destination.CANONICAL_EVENT);
-        PendingJob first = scheduled.pending(Destination.CANONICAL_EVENT, 10).get(0);
+        PendingJob first = scheduled.claim(
+                Destination.CANONICAL_EVENT, 10, "worker-a", Duration.ofSeconds(30)).get(0);
 
         scheduled.failed(first, "the broker is down");
 
@@ -98,7 +100,8 @@ class InMemoryIntakeStoreTest {
 
         clock.advance(Duration.ofSeconds(1));
 
-        PendingJob second = scheduled.pending(Destination.CANONICAL_EVENT, 10).get(0);
+        PendingJob second = scheduled.claim(
+                Destination.CANONICAL_EVENT, 10, "worker-a", Duration.ofSeconds(30)).get(0);
         assertEquals(first.job(), second.job());
 
         scheduled.failed(second, "still down");
@@ -106,6 +109,65 @@ class InMemoryIntakeStoreTest {
         assertEquals(2, scheduled.attempts(job));
         assertEquals(clock.instant().plusSeconds(2), scheduled.nextAttemptAt(job),
                 "the wait doubles with each attempt");
+    }
+
+    @Test
+    void aClaimedJobIsNotOfferedAgainWhileItsLeaseLives() {
+        MutableClock clock = new MutableClock(NOW);
+        InMemoryIntakeStore scheduled = new InMemoryIntakeStore(clock);
+        scheduled.accept(quetzal("evt_01"));
+
+        List<PendingJob> first = scheduled.claim(
+                Destination.CANONICAL_EVENT, 10, "worker-a", Duration.ofSeconds(30));
+        List<PendingJob> second = scheduled.claim(
+                Destination.CANONICAL_EVENT, 10, "worker-b", Duration.ofSeconds(30));
+
+        assertEquals(1, first.size());
+        assertEquals(List.of(), second, "a live lease keeps the job away from a second worker");
+    }
+
+    @Test
+    void anExpiredLeaseIsClaimableByAnotherWorker() {
+        MutableClock clock = new MutableClock(NOW);
+        InMemoryIntakeStore scheduled = new InMemoryIntakeStore(clock);
+        scheduled.accept(quetzal("evt_01"));
+
+        PendingJob first = scheduled.claim(
+                Destination.CANONICAL_EVENT, 10, "worker-a", Duration.ofSeconds(1)).get(0);
+        clock.advance(Duration.ofSeconds(2));
+        PendingJob second = scheduled.claim(
+                Destination.CANONICAL_EVENT, 10, "worker-b", Duration.ofSeconds(30)).get(0);
+
+        assertEquals(first.job(), second.job(), "the work comes back, it is not parked forever");
+        assertNotEquals(first.claimToken(), second.claimToken());
+    }
+
+    @Test
+    void aWorkerWhoseLeaseExpiredCannotCompleteTheJob() {
+        MutableClock clock = new MutableClock(NOW);
+        InMemoryIntakeStore scheduled = new InMemoryIntakeStore(clock);
+        scheduled.accept(quetzal("evt_01"));
+
+        PendingJob stale = scheduled.claim(
+                Destination.CANONICAL_EVENT, 10, "worker-a", Duration.ofSeconds(1)).get(0);
+        clock.advance(Duration.ofSeconds(2));
+        PendingJob current = scheduled.claim(
+                Destination.CANONICAL_EVENT, 10, "worker-b", Duration.ofSeconds(30)).get(0);
+
+        assertThrows(ClaimLostException.class, () -> scheduled.published(stale),
+                "the expired worker must not mark someone else's job done");
+
+        scheduled.published(current);
+        assertEquals(List.of(), scheduled.pending(Destination.CANONICAL_EVENT, 10));
+    }
+
+    @Test
+    void aJobReadWithoutAClaimCannotBeCompleted() {
+        store.accept(quetzal("evt_01"));
+        PendingJob read = store.pending(Destination.CANONICAL_EVENT, 10).get(0);
+
+        assertThrows(IllegalArgumentException.class, () -> store.published(read),
+                "reading is not claiming");
     }
 
     private static CanonicalEvent quetzal(String eventId) {

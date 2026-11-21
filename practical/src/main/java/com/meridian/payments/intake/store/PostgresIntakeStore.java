@@ -12,6 +12,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
@@ -64,24 +65,60 @@ public final class PostgresIntakeStore implements IntakeStore, OutboxStore {
             LIMIT ?
             """;
 
+    private static final String CLAIMABLE = """
+            SELECT outbox_id
+            FROM outbox_job
+            WHERE destination = ?
+              AND ((state = 'PENDING' AND next_attempt_at <= now())
+                   OR (state = 'CLAIMED' AND claim_expires_at <= now()))
+            ORDER BY next_attempt_at, outbox_id
+            LIMIT ?
+            FOR UPDATE SKIP LOCKED
+            """;
+
+    private static final String MARK_CLAIMED = """
+            UPDATE outbox_job
+            SET state = 'CLAIMED',
+                claim_owner = ?,
+                claim_token = CAST(? AS uuid),
+                claim_expires_at = now() + make_interval(secs => ?)
+            WHERE outbox_id = ANY(?)
+            """;
+
+    private static final String CLAIMED_JOBS = """
+            SELECT o.outbox_id, e.provider, e.event_id, e.canonical
+            FROM outbox_job o
+            JOIN payment_event e ON e.intake_id = o.intake_id
+            WHERE o.outbox_id = ANY(?)
+            ORDER BY o.next_attempt_at, o.outbox_id
+            """;
+
     private static final String MARK_PUBLISHED = """
             UPDATE outbox_job o
-            SET state = 'PUBLISHED', published_at = now()
+            SET state = 'PUBLISHED',
+                published_at = now(),
+                claim_owner = NULL,
+                claim_token = NULL,
+                claim_expires_at = NULL
             FROM payment_event e
             WHERE o.intake_id = e.intake_id
               AND e.provider = ? AND e.event_id = ? AND o.destination = ?
-              AND o.state = 'PENDING'
+              AND o.claim_token = CAST(? AS uuid)
             """;
 
     private static final String MARK_FAILED = """
             UPDATE outbox_job o
             SET attempts = o.attempts + 1,
+                state = 'PENDING',
                 last_error = left(?, 500),
+                claim_owner = NULL,
+                claim_token = NULL,
+                claim_expires_at = NULL,
                 next_attempt_at = now() + make_interval(secs => LEAST(60, (1 << LEAST(o.attempts, 6))))
             FROM payment_event e
             WHERE o.intake_id = e.intake_id
               AND e.provider = ? AND e.event_id = ? AND o.destination = ?
-              AND o.state = 'PENDING'
+              AND o.claim_token = CAST(? AS uuid)
             """;
 
     private final Database database;
@@ -153,22 +190,116 @@ public final class PostgresIntakeStore implements IntakeStore, OutboxStore {
     @Override
     public void published(PendingJob job) {
         Objects.requireNonNull(job, "job");
-        update(MARK_PUBLISHED, statement -> {
+        requireClaim(job);
+        int updated = update(MARK_PUBLISHED, statement -> {
             statement.setString(1, job.job().provider().name());
             statement.setString(2, job.job().eventId());
             statement.setString(3, job.job().destination().name());
+            statement.setString(4, job.claimToken());
         });
+        if (updated == 0) {
+            throw new ClaimLostException("the lease on " + job.job() + " belongs to another worker now");
+        }
     }
 
     @Override
     public void failed(PendingJob job, String reason) {
         Objects.requireNonNull(job, "job");
-        update(MARK_FAILED, statement -> {
+        requireClaim(job);
+        int updated = update(MARK_FAILED, statement -> {
             statement.setString(1, reason == null ? "publication failed" : reason);
             statement.setString(2, job.job().provider().name());
             statement.setString(3, job.job().eventId());
             statement.setString(4, job.job().destination().name());
+            statement.setString(5, job.claimToken());
         });
+        if (updated == 0) {
+            throw new ClaimLostException("the lease on " + job.job() + " belongs to another worker now");
+        }
+    }
+
+    /**
+     * Takes due jobs with {@code FOR UPDATE SKIP LOCKED}, so two workers polling at the same instant
+     * split the batch instead of blocking each other or both sending the same message.
+     */
+    @Override
+    public List<PendingJob> claim(Destination destination, int limit, String owner, Duration lease) {
+        Objects.requireNonNull(destination, "destination");
+        Objects.requireNonNull(owner, "owner");
+        Objects.requireNonNull(lease, "lease");
+        if (limit < 1) {
+            throw new IllegalArgumentException("a batch needs at least one job");
+        }
+        if (lease.isNegative() || lease.isZero()) {
+            throw new IllegalArgumentException("a lease must last longer than nothing");
+        }
+        try (Connection connection = database.connection()) {
+            connection.setAutoCommit(false);
+            try {
+                List<Long> ids = dueIds(connection, destination, limit);
+                if (ids.isEmpty()) {
+                    connection.commit();
+                    return List.of();
+                }
+                String token = UUID.randomUUID().toString();
+                try (PreparedStatement statement = connection.prepareStatement(MARK_CLAIMED)) {
+                    statement.setString(1, owner);
+                    statement.setString(2, token);
+                    statement.setLong(3, Math.max(1, lease.toSeconds()));
+                    statement.setArray(4, connection.createArrayOf("bigint", ids.toArray()));
+                    statement.executeUpdate();
+                }
+                List<PendingJob> claimed = claimedJobs(connection, ids, destination, token);
+                connection.commit();
+                return claimed;
+            } catch (SQLException | JsonProcessingException e) {
+                rollbackQuietly(connection);
+                throw new StoreUnavailableException("the outbox could not be claimed", e);
+            }
+        } catch (SQLException e) {
+            throw new StoreUnavailableException("the outbox could not be claimed", e);
+        }
+    }
+
+    private List<Long> dueIds(Connection connection, Destination destination, int limit)
+            throws SQLException {
+        List<Long> ids = new ArrayList<>();
+        try (PreparedStatement statement = connection.prepareStatement(CLAIMABLE)) {
+            statement.setString(1, destination.name());
+            statement.setInt(2, limit);
+            try (ResultSet rows = statement.executeQuery()) {
+                while (rows.next()) {
+                    ids.add(rows.getLong("outbox_id"));
+                }
+            }
+        }
+        return ids;
+    }
+
+    private List<PendingJob> claimedJobs(
+            Connection connection, List<Long> ids, Destination destination, String token)
+            throws SQLException, JsonProcessingException {
+        List<PendingJob> claimed = new ArrayList<>(ids.size());
+        try (PreparedStatement statement = connection.prepareStatement(CLAIMED_JOBS)) {
+            statement.setArray(1, connection.createArrayOf("bigint", ids.toArray()));
+            try (ResultSet rows = statement.executeQuery()) {
+                while (rows.next()) {
+                    Provider provider = Provider.valueOf(rows.getString("provider"));
+                    String eventId = rows.getString("event_id");
+                    CanonicalEvent event = CanonicalEvents.fromJson(
+                            (ObjectNode) JSON.readTree(rows.getString("canonical")));
+                    claimed.add(new PendingJob(
+                            new OutboxJob(provider, eventId, destination), event, token));
+                }
+            }
+        }
+        return claimed;
+    }
+
+    private static void requireClaim(PendingJob job) {
+        if (!job.claimed()) {
+            throw new IllegalArgumentException("a job must be claimed before it can be completed");
+        }
     }
 
     /** When the job is next due, for tests and for the operations view that will come later. */
@@ -224,11 +355,11 @@ public final class PostgresIntakeStore implements IntakeStore, OutboxStore {
         }
     }
 
-    private void update(String sql, StatementBinder binder) {
+    private int update(String sql, StatementBinder binder) {
         try (Connection connection = database.connection();
              PreparedStatement statement = connection.prepareStatement(sql)) {
             binder.bind(statement);
-            statement.executeUpdate();
+            return statement.executeUpdate();
         } catch (SQLException e) {
             throw new StoreUnavailableException("the outbox could not be updated", e);
         }
