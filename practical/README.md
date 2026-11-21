@@ -42,6 +42,9 @@ samples from `reference/providers/` and the event schema from `docs/api/`.
 practical/
   pom.xml
   src/main/java/com/meridian/payments/intake/
+    NotificationIntake.java          authenticity, then event, then durability
+    IntakeOutcome.java               ACCEPTED or DUPLICATE, with the event
+    WebhookRejectedException.java    not authentic, not read
     auth/
       Provider.java                  provider enum
       WebhookRequest.java            provider + headers + raw body bytes
@@ -59,9 +62,18 @@ practical/
       Payloads.java                  field reading rules shared by both mappers
       QuetzalCanonicalEventMapper.java
       AndinaCanonicalEventMapper.java
+    store/
+      IntakeStore.java               persistence boundary
+      InMemoryIntakeStore.java       in-memory inbox and outbox, one transaction
+      Acceptance.java                ACCEPTED or DUPLICATE
+      OutboxJob.java                 one unit of work per destination
+      Destination.java               SALESFORCE and CANONICAL_EVENT
+      StoreUnavailableException.java nothing was written
   src/test/java/com/meridian/payments/intake/
-    TestSamples.java                 published vectors, samples and the schema path
+    TestSamples.java                 published samples and the schema path
+    NotificationIntakeTest.java      the whole path with the real pieces
     auth/                            signature tests
+    store/InMemoryIntakeStoreTest.java
     canonical/
       CanonicalEventContractTest.java       produced events against the published schema
       QuetzalCanonicalEventMapperTest.java
@@ -129,9 +141,30 @@ Decisions worth knowing, each one pinned by a test:
 - **Payer data is dropped at the adapter.** The event is serialised in the test and scanned for
   emails, names, documents, payment tokens and the provider's per-attempt `notificacion_id`.
 
+## Implemented: durability and deduplication (FR4, NFR3)
+
+`com.meridian.payments.intake.NotificationIntake` runs the three steps in the order the contract
+promises: verify the signature, build the event, then write it. Verification comes first so a hostile
+body never reaches the JSON reader, and an authentic body is never rejected for a reason that belongs
+to the parser.
+
+`store.IntakeStore` states the contract the design relies on, and `InMemoryIntakeStore` reproduces it
+without a database:
+
+- `(provider, event_id)` is unique. A second delivery is `DUPLICATE`: a 2xx with no new event and no
+  new outbox job. It is not an error.
+- An accepted event gets exactly one `SALESFORCE` job and one `CANONICAL_EVENT` job.
+- The event and both jobs commit together. A failure leaves the store exactly as it was, so a 2xx has
+  not been earned and the provider's retry is what produces durability.
+
+The in-memory transaction stages into copies and publishes them only after every write would have
+succeeded. That is what lets the injected failures prove the atomicity claim: the tests make the
+store fail before the transaction and in the middle of it, and assert that nothing survives either
+time.
+
 ## Tests and evidence
 
-91 JUnit 5 tests.
+102 JUnit 5 tests.
 
 Authentication (51):
 
@@ -155,22 +188,41 @@ Canonical mapping (40):
   zero amount, a missing `notificacion_id`, and a mapper handed the other provider's document;
 - the serialised event carries no payer data and no provider notification id.
 
-RED/GREEN evidence was captured from the container build:
+Store and intake (11):
+
+- the first acceptance writes the event and one job per destination;
+- a duplicate adds no event and no job, and the same id from another provider is a different event;
+- a store that fails before or in the middle of the transaction leaves nothing behind, and the retry
+  then succeeds;
+- over the real pipeline: a signed Quetzal notification is accepted, the Andina retry is a duplicate
+  while a new state is a new event, an invalid signature and an unmappable reference store nothing,
+  authenticity is checked before parsing, and a store failure reaches the caller instead of becoming
+  a false 2xx.
+
+RED/GREEN evidence was captured from the container build for the first two lots:
 
 - authentication: 51 tests, 50 failing before the implementation (assertion failures, no compilation
   error), then 51 passing;
 - canonical mapping: 90 tests, 39 failing before the implementation (11 failures and 28 errors, all
   `NOT_IMPLEMENTED`, no compilation error), then 91 passing with `BUILD SUCCESS`.
 
+The store and intake lot was written together with its tests, so it has no red-phase capture; its
+evidence is the full suite green plus the injected-failure cases above.
+
 ## Stubbed
 
 - Secrets: in-memory provider; the design reads Azure Key Vault.
-- Store (inbox/outbox), broker and Salesforce: interfaces in the design, not implemented yet.
+- Store: in-memory implementation behind `IntakeStore`; the design puts PostgreSQL behind it, with
+  the same unique constraint and the same transaction boundary.
+- Broker and Salesforce: interfaces in the design, not implemented yet. The outbox rows are written,
+  but nothing drains them.
 
 ## Known gaps
 
 - No HTTP server: the size limit, the content-type check, the translation of a failure code to
   `400`/`401`/`413`/`503` and the receipt bodies belong to the next lot.
-- No inbox/outbox transaction, idempotency enforcement or publication yet.
+- No publisher: the `CANONICAL_EVENT` job is recorded and never sent, and `MessageId` is not built yet.
+- No relay to Salesforce: the `SALESFORCE` job is recorded and never processed, so no batching, no
+  backoff and no dead letter.
 - `paid_at` and `refunded_at` fall back to `created` when absent. A stricter reading would reject
   those notifications instead; the trade-off is revisited when the store owns the atomicity.
