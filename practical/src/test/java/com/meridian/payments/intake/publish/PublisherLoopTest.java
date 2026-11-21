@@ -22,6 +22,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * The polling role, without a test calling the publisher by hand.
@@ -52,11 +53,26 @@ class PublisherLoopTest {
             loop.start();
 
             assertTrue(published.await(5, TimeUnit.SECONDS), "the loop must publish on its own tick");
+            // The latch fires inside broker.publish, one instruction before the store marks the job
+            // published. A loaded runner loses that race and the assertion below sees the job still
+            // pending. Wait for the state the invariant is about, not for the broker call, while the
+            // loop is still alive to finish the tick it started.
+            awaitEmptyOutbox(5);
         }
 
         assertEquals(1, messages.size());
         assertEquals("QUETZAL:" + event.eventId(), messages.get(0).messageId());
-        assertEquals(0, store.pending(Destination.CANONICAL_EVENT, 10).size());
+    }
+
+    /** Waits, with a deadline, until the canonical outbox has nothing due. */
+    private void awaitEmptyOutbox(int seconds) throws InterruptedException {
+        Instant deadline = Instant.now().plusSeconds(seconds);
+        while (!store.pending(Destination.CANONICAL_EVENT, 10).isEmpty()) {
+            if (Instant.now().isAfter(deadline)) {
+                fail("the published job is still pending after " + seconds + " seconds");
+            }
+            Thread.sleep(5);
+        }
     }
 
     @Test
