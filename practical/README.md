@@ -232,8 +232,7 @@ application's:
   integration test pins them together: one failure schedules a second, the next two, then four;
 - the payment projection (`payment_state`) moves inside the same transaction. It keeps the newest status
   by the provider's own timestamp, so a capture that arrives late cannot undo a reversal, and its
-  `remote_applied_status` is written by nobody yet: a local insert is not evidence that Salesforce
-  applied anything.
+  `remote_applied_status` is written by the Salesforce relay after an applied result, not by intake.
 
 ### What a crash proves
 
@@ -379,6 +378,25 @@ worker's normal claim path handles expiry. The immutable event and its other des
 change. The Salesforce relay still skips an older event as `STALE_SKIPPED`. A replay of a `HELD`
 job is an explicit operator choice: reconcile the ambiguous write before requesting it.
 
+## INC-0412: query and recovery
+
+Find terminal Salesforce `INVALID_FIELD` outcomes without reading a stack trace. The code also
+covers other invalid fields; it does not identify the field on its own.
+
+```sql
+SELECT e.provider, e.event_id, e.payment_key, o.outcome_code
+FROM outbox_job o JOIN payment_event e USING (intake_id)
+WHERE o.destination = 'SALESFORCE' AND o.state = 'DEAD'
+  AND o.outcome_code = 'INVALID_FIELD';
+```
+
+`Incident0412IT` runs a reduced scenario against PostgreSQL and `SimulatedSalesforce`. Three
+notifications with the same invalid policy reference become queryable terminal jobs while unrelated
+payments are applied. A newer notification with a corrected reference is applied. Replaying one
+of the old events records the operator's justification and makes that job due, but the normal
+ordering check marks it `STALE_SKIPPED` without another client call or a status overwrite.
+This is not a reproduction of the v1 Service Bus delivery counts, alerts or Salesforce data.
+
 ## Running it
 
 Two profiles. The durable one needs nothing but Docker:
@@ -394,8 +412,8 @@ it, with a body signed the way the provider signs it:
   `outbox_job` rows;
 - the same body again: `200 {"status":"DUPLICATE"}`, and the counts do not change;
 - a tampered signature: `401 {"error":{"code":"SIGNATURE_INVALID",...}}`;
-- ten seconds later the `CANONICAL_EVENT` job is `PUBLISHED` and the `SALESFORCE` job is still
-  `PENDING`: the two lanes drain independently.
+- on their polling ticks, the canonical publisher and the Salesforce simulator process their
+  respective jobs independently.
 
 The sandbox vectors and the signature scheme are in `../reference/providers/*/WEBHOOK_SPEC.md`.
 
@@ -417,7 +435,7 @@ store is no longer one of them.
 
 ## Tests and evidence
 
-199 JUnit 5 tests: 158 need nothing but a JVM, and 41 more run against a real PostgreSQL when
+200 JUnit 5 tests: 158 need nothing but a JVM, and 42 more run against a real PostgreSQL when
 `INTAKE_IT_JDBC_URL` is set (CI sets it, so they are a gate and not a local habit).
 
 Authentication (51):
@@ -553,8 +571,8 @@ no red-phase capture; their evidence is the full suite green plus the injected f
   durable; the next hop is not yet.
 - The pool is one size for the whole process (eight connections). Per-role pools belong with the
   process split into roles.
-- No dead-letter rule: a publication that keeps failing retries forever with a sixty-second cap. Part
-  A's design puts the dead letter on the broker and on the relay; here the job simply stays pending.
+- No dead-letter rule for the canonical publisher: a publication that keeps failing remains pending
+  and retries with a sixty-second cap. The Salesforce relay does mark terminal invalid fields `DEAD`.
 - The crash evidence is one container killed and restarted against the same database. A database
   failover, a region failure and a restore from backup are not tested, and nothing here claims them.
 - No relay against a real Salesforce: the client is a simulator with a scripted fault matrix. The port is
@@ -566,6 +584,7 @@ no red-phase capture; their evidence is the full suite green plus the injected f
 - Replay is a JDBC operator tool, not an authenticated service. The requester is supplied by the
   caller; access and identity must be controlled outside the CLI. The audit records the queue
   reset, not the eventual delivery outcome.
+- The incident fixture tests classification and recovery, not production alerting or reconciliation.
 - Content-type is not gated, on purpose: the contract declares a JSON body and its error enum has no
   code for an unsupported media type.
 - `paid_at` and `refunded_at` fall back to `created` when absent. A stricter reading would reject
