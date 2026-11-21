@@ -10,6 +10,7 @@
 | Tool (name and version, if known) | Where you used it (part and files) | What you used it for |
 |---|---|---|
 | OpenCode with GPT-6.2 Sol | G2: Salesforce usage guard, replay command, and INC-0412 fixture under `practical/` | Inspected the relay and migrations, drafted code and tests, and ran local verification. |
+| OpenCode with GPT-6.2 Sol | G3a: local Operations API, PostgreSQL migrations, tests and API documentation | Mapped the existing server and replay seams, wrote contract tests before the implementation, and ran local verification. |
 
 ## Validation
 
@@ -18,6 +19,10 @@
 For G2, the assistant ran the Java 21 Maven suite with PostgreSQL 16 and reviewed the shared
 admission and replay transactions with independent probes. INC-0412 used the fictional fixture
 and a simulated client; it did not use a Salesforce org.
+
+G3a used a local PostgreSQL 16 database and real HTTP requests to verify signed-token rejection,
+role and country isolation, and the committed replay audit. The local token issuer and test
+destinations were fixtures, not production services.
 
 ## What I discarded or corrected
 
@@ -34,3 +39,4 @@ and a simulated client; it did not use a Salesforce org.
 
 G2 used repository source, fictional assessment examples, and local PostgreSQL test output.
 No real Salesforce credentials or customer data were used.
+G3a also used only repository source, test fixtures and local outputs.

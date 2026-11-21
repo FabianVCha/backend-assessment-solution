@@ -54,6 +54,12 @@ public final class PostgresIntakeStore implements IntakeStore, OutboxStore {
             VALUES (?, ?, ?)
             """;
 
+    private static final String COUNT_DUPLICATE = """
+            UPDATE payment_event
+            SET duplicate_count = duplicate_count + 1, last_duplicate_at = statement_timestamp()
+            WHERE provider = ? AND event_id = ?
+            """;
+
     private static final String DUE_JOBS = """
             SELECT o.destination, o.attempts, e.provider, e.event_id, e.canonical
             FROM outbox_job o
@@ -164,8 +170,13 @@ public final class PostgresIntakeStore implements IntakeStore, OutboxStore {
             try {
                 UUID intakeId = UUID.randomUUID();
                 if (!insertEvent(connection, intakeId, event)) {
-                    // Nothing of ours to commit: the event that exists is the other delivery's.
-                    connection.rollback();
+                    // Record the delivery against the winning event, without touching its facts or jobs.
+                    try (var duplicate = connection.prepareStatement(COUNT_DUPLICATE)) {
+                        duplicate.setString(1, event.provider().name());
+                        duplicate.setString(2, event.eventId());
+                        duplicate.executeUpdate();
+                    }
+                    connection.commit();
                     return Acceptance.DUPLICATE;
                 }
                 insertJob(connection, intakeId, Destination.CANONICAL_EVENT);

@@ -397,6 +397,17 @@ of the old events records the operator's justification and makes that job due, b
 ordering check marks it `STALE_SKIPPED` without another client call or a status overwrite.
 This is not a reproduction of the v1 Service Bus delivery counts, alerts or Salesforce data.
 
+## Implemented locally: Operations API (G3a)
+
+The same JDK server can expose `/ops/v1` for operators without changing the provider routes.
+See the [operations API contract](../docs/api/operations-v1.md) for setup, roles, filters, timeline
+semantics and replay. This profile requires PostgreSQL. With no ops environment variables, it is off.
+
+The local profile verifies short-lived HS256 bearer tokens configured by environment. Production
+would use the organization's OIDC provider through the `OpsIdentity` port; that adapter, production
+TLS and operating controls are not implemented or validated. The broker and Salesforce remain
+simulated.
+
 ## Running it
 
 Two profiles. The durable one needs nothing but Docker:
@@ -435,7 +446,7 @@ store is no longer one of them.
 
 ## Tests and evidence
 
-200 JUnit 5 tests: 158 need nothing but a JVM, and 42 more run against a real PostgreSQL when
+207 JUnit 5 tests: 158 need nothing but a JVM, and 49 more run against a real PostgreSQL when
 `INTAKE_IT_JDBC_URL` is set (CI sets it, so they are a gate and not a local habit).
 
 Authentication (51):
@@ -503,6 +514,10 @@ Replay (9, against PostgreSQL):
 - a replayed older event is skipped without a remote write or a change to the applied status;
 - the CLI rejects unknown destinations, unknown events, and reuse of a key for another target;
 - concurrent duplicate requests reset once, and an audit failure rolls back the whole command.
+
+Operations API (7, against PostgreSQL over a real socket): token rejection and role checks, country
+isolation, cursor bounds, empty versus unavailable overview, dead and retry timelines, worker
+milestones, and country-scoped replay with a committed audit row.
 
 Store and intake (16):
 
@@ -581,8 +596,8 @@ no red-phase capture; their evidence is the full suite green plus the injected f
   internal refreshes or retries and for other consumers of the same Salesforce quota. A process
   killed during a call can leave an in-flight reservation; there is no automatic reclamation.
   Admission history has no retention job yet.
-- Replay is a JDBC operator tool, not an authenticated service. The requester is supplied by the
-  caller; access and identity must be controlled outside the CLI. The audit records the queue
+- The legacy JDBC replay CLI accepts a caller-supplied requester and must be protected externally.
+  The local HTTP replay endpoint derives its requester and scope from its token. Both audit the queue
   reset, not the eventual delivery outcome.
 - The incident fixture tests classification and recovery, not production alerting or reconciliation.
 - Content-type is not gated, on purpose: the contract declares a JSON body and its error enum has no

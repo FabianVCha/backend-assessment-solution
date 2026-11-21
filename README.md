@@ -70,6 +70,9 @@ To pass, you need a strong overall result **and** a solid result in every part. 
 | `pr-review/` | Pull request PR-214 to review in Part E |
 | `docs/`, `practical/`, `infra/`, `.github/workflows/` | Where your deliverables go |
 
+The practical service also has a local [Operations API](docs/api/operations-v1.md) for country-scoped
+notification queries and audited replay. The production OIDC integration is designed only.
+
 Good luck — we look forward to discussing your decisions with you.
 
 ---
