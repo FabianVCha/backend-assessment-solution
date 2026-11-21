@@ -23,6 +23,11 @@ import java.sql.Statement;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorCompletionService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -70,6 +75,7 @@ class SalesforceRelayIT {
         execute("DELETE FROM outbox_job");
         execute("DELETE FROM payment_event");
         execute("DELETE FROM payment_state");
+        execute("TRUNCATE salesforce_budget, salesforce_budget_call");
     }
 
     @Test
@@ -132,6 +138,161 @@ class SalesforceRelayIT {
         long rateLimited = count("SELECT count(*) FROM outbox_job WHERE state = 'PENDING' "
                 + "AND outcome_code = 'RATE_LIMITED'");
         assertEquals(2, rateLimited, "both jobs wait for the budget to recover");
+    }
+
+    @Test
+    void anAdmittedWriteCountsBeforeTheCallAndReleasesAfterIt() throws SQLException {
+        accept("evt-budget-admitted", "B-1", "CAPTURED", Instant.EPOCH);
+        long[] duringCall = new long[2];
+        SalesforceClient client = write -> {
+            try {
+                duringCall[0] = count("SELECT sum(calls) FROM salesforce_budget");
+                duringCall[1] = count("SELECT sum(in_flight) FROM salesforce_budget");
+            } catch (SQLException e) {
+                throw new AssertionError(e);
+            }
+            return SalesforceClient.Result.APPLIED;
+        };
+
+        assertEquals(1, new SalesforceRelay(store, client, 10).drain());
+
+        assertEquals(1, duringCall[0]);
+        assertEquals(1, duringCall[1]);
+        assertEquals(1, count("SELECT sum(calls) FROM salesforce_budget"));
+        assertEquals(0, count("SELECT sum(in_flight) FROM salesforce_budget"));
+    }
+
+    @Test
+    void rollingLimitIncludesCallsFromYesterdayAndDefersTheWholeBatch() throws SQLException {
+        execute("""
+                INSERT INTO salesforce_budget VALUES
+                    ((now() AT TIME ZONE 'UTC')::date - 1, 1, 0),
+                    ((now() AT TIME ZONE 'UTC')::date, 149999, 0);
+                INSERT INTO salesforce_budget_call(admitted_at)
+                    VALUES (date_trunc('day', now(), 'UTC') - interval '1 microsecond')
+                """);
+        accept("evt-budget-first", "B-2", "CAPTURED", Instant.EPOCH);
+        accept("evt-budget-rest", "B-3", "CAPTURED", Instant.EPOCH);
+        SimulatedSalesforce salesforce = new SimulatedSalesforce();
+
+        assertEquals(0, relay(salesforce).drain());
+
+        assertEquals(0, salesforce.writeCount());
+        assertEquals(2, count("""
+                SELECT count(*) FROM outbox_job WHERE destination = 'SALESFORCE'
+                  AND state = 'PENDING' AND outcome_code = 'BUDGET_EXHAUSTED' AND attempts = 0
+                  AND claim_token IS NULL
+                  AND next_attempt_at BETWEEN now() + interval '2 minutes' AND now() + interval '3 minutes'
+                """));
+        assertEquals(150_000, count("SELECT sum(calls) FROM salesforce_budget"));
+
+        execute("UPDATE salesforce_budget_call SET admitted_at = now() - interval '25 hours'");
+        execute("UPDATE outbox_job SET next_attempt_at = now() WHERE destination = 'SALESFORCE'");
+        assertEquals(1, relay(salesforce).drain(), "the expired call makes room for exactly one write");
+        assertEquals(1, salesforce.writeCount());
+    }
+
+    @Test
+    void concurrencyLimitCountsRequestsThatStartedBeforeMidnight() throws SQLException {
+        execute("""
+                INSERT INTO salesforce_budget VALUES ((now() AT TIME ZONE 'UTC')::date - 1, 25, 25)
+                """);
+        accept("evt-budget-busy", "B-4", "CAPTURED", Instant.EPOCH);
+        SimulatedSalesforce salesforce = new SimulatedSalesforce();
+
+        assertEquals(0, relay(salesforce).drain());
+
+        assertEquals(0, salesforce.writeCount());
+        assertEquals("state=PENDING, code=BUDGET_EXHAUSTED", jobState("evt-budget-busy"));
+        assertEquals(25, count("SELECT sum(in_flight) FROM salesforce_budget"));
+        assertEquals(25, count("SELECT sum(calls) FROM salesforce_budget"));
+    }
+
+    @Test
+    void aThrownClientFailureStillReleasesTheInFlightCount() throws SQLException {
+        accept("evt-budget-throw", "B-5", "CAPTURED", Instant.EPOCH);
+        IllegalStateException failure = new IllegalStateException("client failed");
+        SalesforceClient client = write -> { throw failure; };
+
+        assertEquals(failure, assertThrows(IllegalStateException.class,
+                () -> new SalesforceRelay(store, client, 10).drain()));
+
+        assertEquals(1, count("SELECT sum(calls) FROM salesforce_budget"));
+        assertEquals(0, count("SELECT sum(in_flight) FROM salesforce_budget"));
+    }
+
+    @Test
+    void twoReplicasCannotBothTakeTheLastRollingCall() throws Exception {
+        execute("""
+                INSERT INTO salesforce_budget VALUES ((now() AT TIME ZONE 'UTC')::date, 149999, 0)
+                """);
+        raceForLastSlot(150_000, 1, 0);
+    }
+
+    @Test
+    void twoReplicasCannotBothTakeTheLastConcurrentSlot() throws Exception {
+        execute("""
+                INSERT INTO salesforce_budget VALUES ((now() AT TIME ZONE 'UTC')::date - 1, 24, 24)
+                """);
+        raceForLastSlot(25, 25, 24);
+    }
+
+    private static void raceForLastSlot(long finalCalls, long inFlightDuringCall, long finalInFlight)
+            throws Exception {
+        accept("evt-budget-race-a", "race-a", "CAPTURED", Instant.EPOCH);
+        accept("evt-budget-race-b", "race-b", "CAPTURED", Instant.EPOCH);
+        CountDownLatch begin = new CountDownLatch(1);
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicInteger calls = new AtomicInteger();
+        SalesforceClient client = write -> {
+            if (calls.incrementAndGet() == 1) {
+                entered.countDown();
+                await(release);
+            }
+            return SalesforceClient.Result.APPLIED;
+        };
+        try (Database second = Database.open(URL, USER, PASSWORD);
+             var workers = Executors.newFixedThreadPool(2)) {
+            var results = new ExecutorCompletionService<Integer>(workers);
+            try {
+                for (SalesforceStore replica : List.of(store, new PostgresSalesforceStore(second))) {
+                    results.submit(() -> {
+                        await(begin);
+                        return new SalesforceRelay(replica, client, 1).drain();
+                    });
+                }
+                begin.countDown();
+                await(entered);
+                var denied = results.poll(10, TimeUnit.SECONDS);
+                assertNotNull(denied);
+                assertEquals(0, denied.get());
+                assertEquals(1, calls.get());
+                assertEquals(finalCalls, count("SELECT sum(calls) FROM salesforce_budget"));
+                assertEquals(inFlightDuringCall, count("SELECT sum(in_flight) FROM salesforce_budget"));
+                assertEquals(1, count("""
+                        SELECT count(*) FROM outbox_job WHERE state = 'PENDING'
+                            AND outcome_code = 'BUDGET_EXHAUSTED' AND attempts = 0 AND claim_token IS NULL
+                        """));
+
+                release.countDown();
+                var admitted = results.poll(10, TimeUnit.SECONDS);
+                assertNotNull(admitted);
+                assertEquals(1, admitted.get());
+                assertEquals(finalInFlight, count("SELECT sum(in_flight) FROM salesforce_budget"));
+            } finally {
+                release.countDown();
+            }
+        }
+    }
+
+    private static void await(CountDownLatch latch) {
+        try {
+            assertTrue(latch.await(10, TimeUnit.SECONDS), "relay synchronization timed out");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError(e);
+        }
     }
 
     @Test

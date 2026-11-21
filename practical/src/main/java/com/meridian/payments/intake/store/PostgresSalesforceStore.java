@@ -13,11 +13,13 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.UUID;
 
 /**
@@ -108,12 +110,51 @@ public final class PostgresSalesforceStore implements SalesforceStore {
               AND o.claim_token = CAST(? AS uuid)
             """;
 
+    private static final String BUDGET_DEFER = """
+            UPDATE outbox_job o
+            SET state = 'PENDING', outcome_code = 'BUDGET_EXHAUSTED',
+                claim_owner = NULL, claim_token = NULL, claim_expires_at = NULL,
+                next_attempt_at = now() + interval '3 minutes'
+            FROM payment_event e
+            WHERE o.intake_id = e.intake_id
+              AND e.provider = ? AND e.event_id = ? AND o.destination = 'SALESFORCE'
+              AND o.claim_token = CAST(? AS uuid)
+            """;
+
     private static final ObjectMapper JSON = new ObjectMapper();
 
     private final Database database;
+    private final PostgresSalesforceBudget budget;
 
     public PostgresSalesforceStore(Database database) {
         this.database = Objects.requireNonNull(database, "database");
+        this.budget = new PostgresSalesforceBudget(database);
+    }
+
+    @Override
+    public Optional<LocalDate> tryAcquireBudget() {
+        return budget.tryAcquire();
+    }
+
+    @Override
+    public void releaseBudget(LocalDate day) {
+        budget.release(day);
+    }
+
+    @Override
+    public void deferForBudget(PendingJob job) {
+        requireClaim(job);
+        try (Connection connection = database.connection();
+             PreparedStatement statement = connection.prepareStatement(BUDGET_DEFER)) {
+            statement.setString(1, job.job().provider().name());
+            statement.setString(2, job.job().eventId());
+            statement.setString(3, job.claimToken());
+            if (statement.executeUpdate() == 0) {
+                throw new ClaimLostException("the lease on " + job.job() + " belongs to another worker now");
+            }
+        } catch (SQLException e) {
+            throw new StoreUnavailableException("the Salesforce lane could not be deferred", e);
+        }
     }
 
     @Override
