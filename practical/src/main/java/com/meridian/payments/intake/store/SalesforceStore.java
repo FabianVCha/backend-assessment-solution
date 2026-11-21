@@ -1,6 +1,8 @@
 package com.meridian.payments.intake.store;
 
 import java.time.Instant;
+import java.time.LocalDate;
+import java.util.Optional;
 
 /**
  * The Salesforce lane's own view of the outbox: claim a payment fact, decide, record what happened.
@@ -35,4 +37,13 @@ public interface SalesforceStore {
 
     /** Retryable: back to pending with the next attempt scheduled. */
     void failed(PendingJob job, String code);
+
+    /** Reserves a call and one in-flight slot, returning the UTC bucket to release after the call. */
+    Optional<LocalDate> tryAcquireBudget();
+
+    /** Releases concurrency capacity only; the attempted call still counts in the rolling window. */
+    void releaseBudget(LocalDate day);
+
+    /** Defers a claimed job without counting an attempt: no write was made. */
+    void deferForBudget(PendingJob job);
 }

@@ -5,8 +5,10 @@ import com.meridian.payments.intake.store.PendingJob;
 import com.meridian.payments.intake.store.SalesforceStore;
 
 import java.time.Duration;
+import java.time.LocalDate;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.logging.Logger;
 
@@ -59,7 +61,12 @@ public final class SalesforceRelay {
         List<PendingJob> batch = store.claimDue(batchSize, owner, LEASE);
         int applied = 0;
         boolean rateLimited = false;
+        boolean budgetExhausted = false;
         for (PendingJob job : batch) {
+            if (budgetExhausted) {
+                deferForBudget(job);
+                continue;
+            }
             if (rateLimited) {
                 // The budget is shared and exhausted: putting the rest back is honest, holding them until
                 // the lease expires is not.
@@ -71,7 +78,18 @@ public final class SalesforceRelay {
                     store.skipped(job);
                     continue;
                 }
-                SalesforceClient.Result result = client.write(writeOf(job));
+                Optional<LocalDate> reservation = store.tryAcquireBudget();
+                if (reservation.isEmpty()) {
+                    budgetExhausted = true;
+                    deferForBudget(job);
+                    continue;
+                }
+                SalesforceClient.Result result;
+                try {
+                    result = client.write(writeOf(job));
+                } finally {
+                    store.releaseBudget(reservation.get());
+                }
                 switch (result) {
                     case APPLIED -> {
                         store.applied(job);
@@ -103,6 +121,14 @@ public final class SalesforceRelay {
         SalesforceStore.PaymentProjection projection = store.projection(job.event().paymentKey());
         return projection != null
                 && job.event().statusChangedAt().isBefore(projection.latestStatusChangedAt());
+    }
+
+    private void deferForBudget(PendingJob job) {
+        try {
+            store.deferForBudget(job);
+        } catch (ClaimLostException e) {
+            LOG.warning("a salesforce lease expired while the lane was deferred");
+        }
     }
 
     private void release(PendingJob job, String code) {
