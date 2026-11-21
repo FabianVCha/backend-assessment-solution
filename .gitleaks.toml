@@ -1,0 +1,23 @@
+# Gitleaks configuration.
+#
+# The exercise publishes sandbox signing vectors in reference/providers/*/WEBHOOK_SPEC.md. They are
+# fixtures for the published test vectors, not credentials: no merchant account exists behind them and
+# they are byte-identical to what the specification prints. The generic-api-key rule scores on entropy,
+# so a constant named "..._SECRET" next to a short token reads like a key.
+#
+# The allowlist hangs off the rule rather than off the top-level table: with a rule-level allowlist the
+# values are excluded even when the scan walks git history, which the top-level form did not do here.
+# Everything else in the default ruleset stays on.
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+  [[rules.allowlists]]
+  description = "Sandbox webhook signing vectors published by the exercise"
+  regexTarget = "match"
+  regexes = [
+    '''qz_test_whsec_[0-9a-f]{12}''',
+    '''andina_test_secret_[0-9a-f]{8}''',
+    '''aus_test_whsec_[0-9a-f]{8}''',
+  ]
