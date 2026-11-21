@@ -52,6 +52,10 @@ Contracts only. No code ships from this directory.
   carried as reported and never accumulated. Andina and Austral report a payment-level reversal with
   no amount, so `refund_scope` is `UNKNOWN` and `refunded_amount_minor` is `null`. No financial total
   or remaining balance can be derived from these events; that reconciliation lives in Finance.
+- **A reported figure above the charge is `UNKNOWN`, never corrected.** If a provider reports a
+  refunded amount greater than the payment, the comparison is not interpretable: `refund_scope` is
+  `UNKNOWN`, the figure is carried as reported and nothing is derived from it. The schema accepts
+  `UNKNOWN` together with an amount for exactly this case.
 - **Ordering.** `status_changed_at` is the only field an ordering rule may use. `received_at` is our
   clock, filled at intake, for freshness only; a retry can arrive hours late with an old state time.
 - **No payer data.** Names, documents and emails travel on the wire and are dropped at the adapter.
