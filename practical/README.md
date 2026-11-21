@@ -446,7 +446,7 @@ store is no longer one of them.
 
 ## Tests and evidence
 
-207 JUnit 5 tests: 158 need nothing but a JVM, and 49 more run against a real PostgreSQL when
+208 JUnit 5 tests: 158 need nothing but a JVM, and 50 more run against a real PostgreSQL when
 `INTAKE_IT_JDBC_URL` is set (CI sets it, so they are a gate and not a local habit).
 
 Authentication (51):
@@ -515,9 +515,10 @@ Replay (9, against PostgreSQL):
 - the CLI rejects unknown destinations, unknown events, and reuse of a key for another target;
 - concurrent duplicate requests reset once, and an audit failure rolls back the whole command.
 
-Operations API (7, against PostgreSQL over a real socket): token rejection and role checks, country
+Operations API (8, against PostgreSQL over a real socket): token rejection and role checks, country
 isolation, cursor bounds, empty versus unavailable overview, dead and retry timelines, worker
-milestones, and country-scoped replay with a committed audit row.
+milestones, and country-scoped replay with a committed audit row. Rejected replay of a claimed
+job leaves both the outbox and audit unchanged.
 
 Store and intake (16):
 

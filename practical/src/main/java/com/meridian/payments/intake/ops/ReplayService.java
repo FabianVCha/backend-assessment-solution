@@ -103,6 +103,12 @@ public final class ReplayService {
                         outcome = event == null ? Outcome.EVENT_NOT_FOUND
                                 : resetJob(connection, event.intakeId(), destination);
                     }
+                    if (countries != null && outcome != Outcome.REQUEUED) {
+                        // HTTP records completed queue resets only. Roll back the provisional key
+                        // along with any work; the legacy CLI still audits rejected decisions.
+                        connection.rollback();
+                        return outcome;
+                    }
                     try (var record = connection.prepareStatement(RECORD_OUTCOME)) {
                         record.setString(1, outcome.name());
                         record.setString(2, keyScope);

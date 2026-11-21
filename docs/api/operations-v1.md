@@ -79,7 +79,8 @@ are limited to 512, 1000 and 128 characters respectively. Do not put payer data 
 HTTP keys are scoped to the target's stored country and separate from legacy CLI keys. Reusing the
 key for the same target and destination returns the original outcome without repeating the reset;
 changing the target or destination within the same scope returns `409 KEY_TARGET_CONFLICT`.
-A claimed job returns `409 JOB_CLAIMED`. Missing or out-of-scope targets do not leave an audit row.
+A claimed job returns `409 JOB_CLAIMED` without consuming the key. Rejected HTTP requests do not
+leave an audit row; the legacy CLI still records rejected commands.
 `REQUEUED` does not mean the destination applied the event. Reconcile `HELD` jobs before replay.
 
 All errors use `{"error":{"code":"…"}}`. Invalid input is `400 INVALID_REQUEST`; missing or invalid

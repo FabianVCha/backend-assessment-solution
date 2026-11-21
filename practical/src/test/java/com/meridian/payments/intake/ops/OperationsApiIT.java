@@ -216,6 +216,21 @@ class OperationsApiIT extends ReplayPostgresFixture {
     }
 
     @Test
+    void claimedHttpReplayDoesNotWrite() throws Exception {
+        try (var database = open(); var server = start(database)) {
+            accept("busy", "pair", "policy", "CAPTURED", NOW);
+            execute("UPDATE outbox_job SET state = 'CLAIMED' WHERE destination = 'SALESFORCE'");
+            String sql = "SELECT md5(string_agg(to_jsonb(o)::text, ',' ORDER BY outbox_id)) FROM outbox_job o";
+            String before = scalar(sql);
+            var reply = request(server, "/replays", token("replay", "CO"),
+                    replayBody("ANDINA", "busy", "case-17"));
+            error(409, "JOB_CLAIMED", reply);
+            assertEquals(0, count("replay_command"));
+            assertEquals(before, scalar(sql));
+        }
+    }
+
+    @Test
     void returnsCommittedReplayOutcomeAndIsolatesKeysByCountry() throws Exception {
         try (var database = open(); var server = start(database)) {
             accept("co", "one", "policy", "CAPTURED", NOW);
