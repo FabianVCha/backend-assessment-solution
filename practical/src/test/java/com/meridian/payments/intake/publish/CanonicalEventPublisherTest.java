@@ -1,5 +1,6 @@
 package com.meridian.payments.intake.publish;
 
+import com.meridian.payments.intake.MutableClock;
 import com.meridian.payments.intake.TestSamples;
 import com.meridian.payments.intake.auth.Provider;
 import com.meridian.payments.intake.auth.WebhookRequest;
@@ -11,7 +12,9 @@ import com.meridian.payments.intake.store.InMemoryIntakeStore;
 import com.meridian.payments.intake.store.OutboxJob;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -71,29 +74,51 @@ class CanonicalEventPublisherTest {
     }
 
     @Test
-    void aBrokerFailureLeavesTheJobPendingAndTheRetryPublishesIt() {
-        CanonicalEvent event = acceptQuetzalSample();
+    void aBrokerFailureWithholdsTheJobUntilItsNextAttempt() {
+        MutableClock clock = new MutableClock(Instant.parse("2026-12-03T15:00:00Z"));
+        InMemoryIntakeStore scheduledStore = new InMemoryIntakeStore(clock);
+        CanonicalEventPublisher scheduled = new CanonicalEventPublisher(scheduledStore, broker, 50);
+        CanonicalEvent event = new QuetzalCanonicalEventMapper().map(
+                new WebhookRequest(Provider.QUETZAL, Map.of(), TestSamples.read(TestSamples.QZ_SUCCEEDED)),
+                RECEIVED_AT);
+        scheduledStore.accept(event);
+        OutboxJob job = new OutboxJob(Provider.QUETZAL, event.eventId(), Destination.CANONICAL_EVENT);
         broker.failNextPublish();
 
-        assertEquals(0, publisher.publishPending());
+        assertEquals(0, scheduled.publishPending(), "the broker failed");
 
-        assertEquals(1, store.pending(Destination.CANONICAL_EVENT, 10).size());
-        assertEquals(1, store.attempts(new OutboxJob(Provider.QUETZAL, event.eventId(), Destination.CANONICAL_EVENT)));
+        assertEquals(1, scheduledStore.attempts(job));
+        assertEquals(List.of(), scheduledStore.pending(Destination.CANONICAL_EVENT, 10),
+                "a failed job is not due again immediately");
+        assertEquals(clock.instant().plusSeconds(1), scheduledStore.nextAttemptAt(job),
+                "the first retry waits one second");
 
-        assertEquals(1, publisher.publishPending());
+        clock.advance(Duration.ofSeconds(1));
+
+        assertEquals(1, scheduled.publishPending(), "the job is due again");
         assertEquals(1, broker.published().size());
-        assertEquals(0, store.pending(Destination.CANONICAL_EVENT, 10).size());
+        assertEquals(0, scheduledStore.pending(Destination.CANONICAL_EVENT, 10).size());
     }
 
     @Test
     void aLostAcknowledgementPublishesTheSameMessageAgain() {
-        CanonicalEvent event = acceptQuetzalSample();
+        MutableClock clock = new MutableClock(Instant.parse("2026-12-03T15:00:00Z"));
+        InMemoryIntakeStore scheduledStore = new InMemoryIntakeStore(clock);
+        CanonicalEventPublisher scheduled = new CanonicalEventPublisher(scheduledStore, broker, 50);
+        CanonicalEvent event = new QuetzalCanonicalEventMapper().map(
+                new WebhookRequest(Provider.QUETZAL, Map.of(), TestSamples.read(TestSamples.QZ_SUCCEEDED)),
+                RECEIVED_AT);
+        scheduledStore.accept(event);
         broker.loseNextAcknowledgement();
 
-        assertEquals(0, publisher.publishPending(), "the ack was lost, so the job is not done");
+        assertEquals(0, scheduled.publishPending(), "the ack was lost, so the job is not done");
         assertEquals(1, broker.published().size(), "the broker did store it");
+        assertEquals(List.of(), scheduledStore.pending(Destination.CANONICAL_EVENT, 10),
+                "the retry waits for its next attempt, it does not spin");
 
-        assertEquals(1, publisher.publishPending());
+        clock.advance(Duration.ofSeconds(1));
+
+        assertEquals(1, scheduled.publishPending());
 
         assertEquals(2, broker.published().size(), "at-least-once: the consumer may see it twice");
         assertEquals("QUETZAL:" + event.eventId(), broker.published().get(0).messageId());

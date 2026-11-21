@@ -3,6 +3,9 @@ package com.meridian.payments.intake.store;
 import com.meridian.payments.intake.auth.Provider;
 import com.meridian.payments.intake.canonical.CanonicalEvent;
 
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -13,13 +16,21 @@ import java.util.Objects;
  *
  * <p>It reproduces the properties the design leans on, not the SQL: a unique
  * {@code (provider, event_id)}, a single transaction that writes the event with both jobs, and an
- * outbox drained per destination where a failed attempt stays pending. The transaction is simulated by
- * staging into copies and publishing them only after every write would have succeeded, so a failure
- * injected in the middle leaves the store exactly as it was.
+ * outbox drained per destination where a failed attempt is withheld until its next attempt time. The
+ * transaction is simulated by staging into copies and publishing them only after every write would
+ * have succeeded, so a failure injected in the middle leaves the store exactly as it was.
  *
- * <p>Not for production: no persistence, no retry schedule and no concurrency control beyond one lock.
+ * <p>The retry schedule is the store's, as {@code SOLUTION_DESIGN.md} §5 places
+ * {@code next_attempt_at} on the outbox row: a failure moves the row into the future, and
+ * {@link #pending} returns only the rows that are due. That is what keeps a broken broker from
+ * becoming a hot loop.
+ *
+ * <p>Not for production: no persistence, no lease or claim and no concurrency control beyond one lock.
  */
 public final class InMemoryIntakeStore implements IntakeStore, OutboxStore {
+
+    /** Longest wait between attempts; the design asks for backoff, not for an infinite curve. */
+    private static final Duration MAXIMUM_BACKOFF = Duration.ofSeconds(60);
 
     private record EventKey(Provider provider, String eventId) {
     }
@@ -28,6 +39,7 @@ public final class InMemoryIntakeStore implements IntakeStore, OutboxStore {
         private final CanonicalEvent event;
         private int attempts;
         private boolean published;
+        private Instant nextAttemptAt;
 
         private JobState(CanonicalEvent event) {
             this.event = event;
@@ -35,10 +47,20 @@ public final class InMemoryIntakeStore implements IntakeStore, OutboxStore {
     }
 
     private final Object lock = new Object();
+    private final Clock clock;
     private final Map<EventKey, CanonicalEvent> events = new LinkedHashMap<>();
     private final Map<OutboxJob, JobState> outbox = new LinkedHashMap<>();
     private boolean failBeforeCommit;
     private boolean failMidTransaction;
+
+    public InMemoryIntakeStore() {
+        this(Clock.systemUTC());
+    }
+
+    /** A store that reads time from the given clock; tests own the clock to assert the schedule. */
+    public InMemoryIntakeStore(Clock clock) {
+        this.clock = Objects.requireNonNull(clock, "clock");
+    }
 
     @Override
     public Acceptance accept(CanonicalEvent event) {
@@ -77,10 +99,13 @@ public final class InMemoryIntakeStore implements IntakeStore, OutboxStore {
     @Override
     public List<PendingJob> pending(Destination destination, int limit) {
         Objects.requireNonNull(destination, "destination");
+        Instant now = clock.instant();
         synchronized (lock) {
             return outbox.entrySet().stream()
                     .filter(entry -> entry.getKey().destination() == destination)
                     .filter(entry -> !entry.getValue().published)
+                    .filter(entry -> entry.getValue().nextAttemptAt == null
+                            || !entry.getValue().nextAttemptAt.isAfter(now))
                     .limit(limit)
                     .map(entry -> new PendingJob(entry.getKey(), entry.getValue().event))
                     .toList();
@@ -95,11 +120,14 @@ public final class InMemoryIntakeStore implements IntakeStore, OutboxStore {
         }
     }
 
+    /** Records the failure and moves the job into the future with a growing wait. */
     @Override
     public void failed(PendingJob job, String reason) {
         Objects.requireNonNull(job, "job");
         synchronized (lock) {
-            state(job).attempts++;
+            JobState state = state(job);
+            state.attempts++;
+            state.nextAttemptAt = clock.instant().plus(backoff(state.attempts));
         }
     }
 
@@ -108,6 +136,14 @@ public final class InMemoryIntakeStore implements IntakeStore, OutboxStore {
         synchronized (lock) {
             JobState state = outbox.get(job);
             return state == null ? 0 : state.attempts;
+        }
+    }
+
+    /** When the job becomes due again, or {@code null} when it was never attempted. */
+    public Instant nextAttemptAt(OutboxJob job) {
+        synchronized (lock) {
+            JobState state = outbox.get(job);
+            return state == null ? null : state.nextAttemptAt;
         }
     }
 
@@ -135,6 +171,12 @@ public final class InMemoryIntakeStore implements IntakeStore, OutboxStore {
         synchronized (lock) {
             return List.copyOf(outbox.keySet());
         }
+    }
+
+    private static Duration backoff(int attempts) {
+        long seconds = 1L << Math.min(attempts - 1, 6);
+        Duration candidate = Duration.ofSeconds(seconds);
+        return candidate.compareTo(MAXIMUM_BACKOFF) > 0 ? MAXIMUM_BACKOFF : candidate;
     }
 
     private JobState state(PendingJob job) {
