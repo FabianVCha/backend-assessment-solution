@@ -68,7 +68,7 @@ practical/
       AndinaCanonicalEventMapper.java
     store/
       IntakeStore.java               persistence boundary
-      OutboxStore.java               outbox drained per destination
+      OutboxStore.java               outbox drained per destination, with a retry schedule
       InMemoryIntakeStore.java       in-memory inbox and outbox, one transaction
       Acceptance.java                ACCEPTED or DUPLICATE
       OutboxJob.java                 one unit of work per destination
@@ -76,6 +76,7 @@ practical/
       Destination.java               SALESFORCE and CANONICAL_EVENT
       StoreUnavailableException.java nothing was written
     publish/
+      PublisherLoop.java             the polling role: ticks the publisher without a human
       CanonicalEventPublisher.java   drains CANONICAL_EVENT into the topic
       Broker.java                    broker boundary
       RecordingBroker.java           stub that records, and can fail or lose an ack
@@ -84,10 +85,12 @@ practical/
       BrokerUnavailableException.java the ack never came
   src/test/java/com/meridian/payments/intake/
     TestSamples.java                 published samples and the schema path
+    MutableClock.java                a clock the tests move by hand
     NotificationIntakeTest.java      the whole path with the real pieces
     auth/                            signature tests
     store/InMemoryIntakeStoreTest.java
     publish/CanonicalEventPublisherTest.java
+    publish/PublisherLoopTest.java
     http/WebhookEndpointTest.java
     canonical/
       CanonicalEventContractTest.java       produced events against the published schema
@@ -179,7 +182,7 @@ time.
 
 ## Implemented: publication to the canonical topic (FR6)
 
-`publish.CanonicalEventPublisher` drains the `CANONICAL_EVENT` outbox job into the topic, in batches:
+`publish.CanonicalEventPublisher` publishes one batch of the `CANONICAL_EVENT` outbox:
 
 - `MessageId` is `provider + ":" + event_id` when that fits in the 128-character broker limit, and
   `"sha256:" + hex(sha256(provider + "|" + event_id))` otherwise. Hashing rather than truncating,
@@ -190,6 +193,17 @@ time.
   at-least-once and consumers deduplicate on `(provider, event_id)`.
 - The publisher touches that destination only. The `SALESFORCE` job stays for a separate relay, so a
   broker outage cannot delay Salesforce and a Salesforce outage cannot delay publication.
+
+`publish.PublisherLoop` is the polling role the design names (`SOLUTION_DESIGN.md` §1.2, §5):
+
+- a fixed-delay tick that calls the publisher, with its own daemon thread, so publishing does not
+  depend on a human or on a request arriving;
+- a tick never kills the loop: a broker failure becomes a pending job with a scheduled retry, and
+  anything unexpected is logged and the next tick tries again;
+- the wait between attempts belongs to the outbox row, as the design places `next_attempt_at` there:
+  one second, doubling, capped at sixty. `pending()` returns only the rows that are due, so a broken
+  broker cannot turn the loop into a hot spin;
+- log lines carry a count only: no provider identifier, no policy number, no payload.
 
 ## Implemented: HTTP surface
 
@@ -212,7 +226,7 @@ has no code for an unsupported media type, so inventing one would break the cont
 
 ## Tests and evidence
 
-117 JUnit 5 tests.
+120 JUnit 5 tests.
 
 Authentication (51):
 
@@ -236,26 +250,28 @@ Canonical mapping (40):
   zero amount, a missing `notificacion_id`, and a mapper handed the other provider's document;
 - the serialised event carries no payer data and no provider notification id.
 
-Store and intake (11):
+Store and intake (12):
 
 - the first acceptance writes the event and one job per destination;
 - a duplicate adds no event and no job, and the same id from another provider is a different event;
 - a store that fails before or in the middle of the transaction leaves nothing behind, and the retry
   then succeeds;
+- a failed attempt is withheld until its next attempt time, and the wait doubles;
 - over the real pipeline: a signed Quetzal notification is accepted, the Andina retry is a duplicate
   while a new state is a new event, an invalid signature and an unmappable reference store nothing,
   authenticity is checked before parsing, and a store failure reaches the caller instead of becoming
   a false 2xx.
 
-Publisher (7):
+Publisher (9):
 
 - a pending event is published with the derived `MessageId` and the canonical correlation id;
 - a published job is not published again;
 - a long identity becomes a stable hash instead of a truncated id;
-- a broker failure leaves the job pending with an attempt recorded, and the next poll publishes it;
+- a broker failure withholds the job until its next attempt, and the retry publishes it;
 - a lost acknowledgement publishes the same message again, with the same `MessageId`;
 - the `SALESFORCE` destination is never touched by the publisher;
-- the batch size is respected.
+- the batch size is respected;
+- the loop publishes with nobody calling the publisher, and a broker failure does not stop it.
 
 HTTP surface (8):
 
@@ -274,14 +290,14 @@ RED/GREEN evidence was captured from the container build for the first two lots:
 - canonical mapping: 90 tests, 39 failing before the implementation (11 failures and 28 errors, all
   `NOT_IMPLEMENTED`, no compilation error), then 91 passing.
 
-The store, publisher and HTTP lots were written together with their tests, so they have no red-phase
-capture; their evidence is the full suite green plus the injected failures above.
+The store, publisher, HTTP and polling-loop lots were written together with their tests, so they have
+no red-phase capture; their evidence is the full suite green plus the injected failures above.
 
 ## Stubbed
 
 - Secrets: in-memory provider; the design reads Azure Key Vault.
 - Store: in-memory implementation behind `IntakeStore` and `OutboxStore`; the design puts PostgreSQL
-  behind them, with the same unique constraint and the same transaction boundary.
+  behind them, with the same unique constraint, the same transaction boundary and `next_attempt_at`.
 - Broker: recording implementation behind `Broker`; the design puts Azure Service Bus behind it.
 - Salesforce: not called anywhere. The `SALESFORCE` job is recorded for a relay that is out of scope
   for this part, as the task states.
@@ -290,8 +306,9 @@ capture; their evidence is the full suite green plus the injected failures above
 
 - No server process: `WebhookEndpoint` is a handler with no framework or runtime adapter attached, so
   nothing listens on a port. The contract, the status codes and the bodies are complete and tested.
-- No scheduler: `publishPending()` runs when it is called. There is no poll timer, no backoff curve
-  and no dead-letter rule for a job that keeps failing; those belong with the infrastructure.
+- No dead-letter rule: a publication that keeps failing retries forever with a sixty-second cap. Part
+  A's design puts the dead letter on the broker and on the relay; here the job simply stays pending.
+- No claim or lease on the outbox row, which one process does not need and two would.
 - No relay to Salesforce: the `SALESFORCE` job is recorded and never processed, so no batching, no
   backoff and no dead letter on that path.
 - Content-type is not gated, on purpose: the contract declares a JSON body and its error enum has no
