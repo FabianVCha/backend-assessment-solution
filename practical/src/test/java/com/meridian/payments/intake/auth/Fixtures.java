@@ -20,10 +20,12 @@ public final class Fixtures {
     // Sandbox test vectors published by the providers. Test-only fixtures, never production secrets.
     public static final String QUETZAL_SECRET = "qz_test_whsec_4f8a1c2e9b7d";
     public static final String ANDINA_SECRET = "andina_test_secret_7c3e19ab";
+    public static final String AUSTRAL_SECRET = "aus_test_whsec_2b9d6f10";
 
     public static final SecretProvider SECRETS = new InMemorySecretProvider(Map.of(
             Provider.QUETZAL, QUETZAL_SECRET.getBytes(StandardCharsets.UTF_8),
-            Provider.ANDINA, ANDINA_SECRET.getBytes(StandardCharsets.UTF_8)));
+            Provider.ANDINA, ANDINA_SECRET.getBytes(StandardCharsets.UTF_8),
+            Provider.AUSTRAL, AUSTRAL_SECRET.getBytes(StandardCharsets.UTF_8)));
 
     public static final String QZ_SUCCEEDED = "quetzal-mx/samples/01-charge-succeeded.json";
     public static final String QZ_FAILED = "quetzal-mx/samples/02-charge-failed.json";
@@ -39,6 +41,18 @@ public final class Fixtures {
 
     public record AndinaVector(String sample, String timestamp, String signature) {
     }
+
+    public record AustralVector(String sample, String signature) {
+    }
+
+    public static final String AU_CONFIRMED = "austral-cl/samples/01-payment-confirmed.json";
+    public static final String AU_REVERSED = "austral-cl/samples/02-payment-reversed.json";
+
+    public static final List<AustralVector> AUSTRAL_VECTORS = List.of(
+            new AustralVector(AU_CONFIRMED,
+                    "ec52aeac3cbb26dbb1650a46ea82fd44c38f99dd6705e7ab413b2704e1482357"),
+            new AustralVector(AU_REVERSED,
+                    "e104a041f3f5fd9bd2bcf2dc746f919fd6f759caeedc450e5f1f247e009d9721"));
 
     public static final List<QuetzalVector> QUETZAL_VECTORS = List.of(
             new QuetzalVector(QZ_SUCCEEDED, "1795888803",
@@ -94,6 +108,14 @@ public final class Fixtures {
             headers.put("X-Andina-Signature", signature);
         }
         return new WebhookRequest(Provider.ANDINA, headers, body);
+    }
+
+    public static WebhookRequest austral(String signature, byte[] body) {
+        Map<String, String> headers = new HashMap<>();
+        if (signature != null) {
+            headers.put("X-Austral-Signature", signature);
+        }
+        return new WebhookRequest(Provider.AUSTRAL, headers, body);
     }
 
     private static Path providerRoot() {

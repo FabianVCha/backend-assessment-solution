@@ -2,10 +2,12 @@ package com.meridian.payments.intake.http;
 
 import com.meridian.payments.intake.NotificationIntake;
 import com.meridian.payments.intake.auth.AndinaSignatureVerifier;
+import com.meridian.payments.intake.auth.AustralSignatureVerifier;
 import com.meridian.payments.intake.auth.Fixtures;
 import com.meridian.payments.intake.auth.Provider;
 import com.meridian.payments.intake.auth.QuetzalSignatureVerifier;
 import com.meridian.payments.intake.canonical.AndinaCanonicalEventMapper;
+import com.meridian.payments.intake.canonical.AustralCanonicalEventMapper;
 import com.meridian.payments.intake.canonical.CanonicalEventMapper;
 import com.meridian.payments.intake.canonical.QuetzalCanonicalEventMapper;
 import com.meridian.payments.intake.store.InMemoryIntakeStore;
@@ -39,9 +41,12 @@ class IntakeServerTest {
         NotificationIntake intake = new NotificationIntake(
                 Map.of(
                         Provider.QUETZAL, new QuetzalSignatureVerifier(Fixtures.SECRETS, clock),
-                        Provider.ANDINA, new AndinaSignatureVerifier(Fixtures.SECRETS, clock)),
+                        Provider.ANDINA, new AndinaSignatureVerifier(Fixtures.SECRETS, clock),
+                        Provider.AUSTRAL, new AustralSignatureVerifier(Fixtures.SECRETS)),
                 List.<CanonicalEventMapper>of(
-                        new QuetzalCanonicalEventMapper(), new AndinaCanonicalEventMapper()),
+                        new QuetzalCanonicalEventMapper(),
+                        new AndinaCanonicalEventMapper(),
+                        new AustralCanonicalEventMapper()),
                 store,
                 clock);
 
@@ -70,9 +75,12 @@ class IntakeServerTest {
         NotificationIntake intake = new NotificationIntake(
                 Map.of(
                         Provider.QUETZAL, new QuetzalSignatureVerifier(Fixtures.SECRETS, clock),
-                        Provider.ANDINA, new AndinaSignatureVerifier(Fixtures.SECRETS, clock)),
+                        Provider.ANDINA, new AndinaSignatureVerifier(Fixtures.SECRETS, clock),
+                        Provider.AUSTRAL, new AustralSignatureVerifier(Fixtures.SECRETS)),
                 List.<CanonicalEventMapper>of(
-                        new QuetzalCanonicalEventMapper(), new AndinaCanonicalEventMapper()),
+                        new QuetzalCanonicalEventMapper(),
+                        new AndinaCanonicalEventMapper(),
+                        new AustralCanonicalEventMapper()),
                 new InMemoryIntakeStore(),
                 clock);
 

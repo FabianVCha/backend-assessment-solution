@@ -1,6 +1,7 @@
 package com.meridian.payments.intake;
 
 import com.meridian.payments.intake.auth.AndinaSignatureVerifier;
+import com.meridian.payments.intake.auth.AustralSignatureVerifier;
 import com.meridian.payments.intake.auth.Fixtures;
 import com.meridian.payments.intake.auth.Provider;
 import com.meridian.payments.intake.auth.QuetzalSignatureVerifier;
@@ -8,6 +9,7 @@ import com.meridian.payments.intake.auth.SignatureVerification;
 import com.meridian.payments.intake.auth.SignatureVerifier;
 import com.meridian.payments.intake.auth.WebhookRequest;
 import com.meridian.payments.intake.canonical.AndinaCanonicalEventMapper;
+import com.meridian.payments.intake.canonical.AustralCanonicalEventMapper;
 import com.meridian.payments.intake.canonical.CanonicalEventMapper;
 import com.meridian.payments.intake.canonical.CanonicalMappingException;
 import com.meridian.payments.intake.canonical.QuetzalCanonicalEventMapper;
@@ -98,7 +100,9 @@ class NotificationIntakeTest {
     @Test
     void anUnmappableNotificationIsRejectedAndStoredNowhere() {
         NotificationIntake intake = new NotificationIntake(
-                Map.of(Provider.QUETZAL, alwaysAuthentic(), Provider.ANDINA, alwaysAuthentic()),
+                Map.of(Provider.QUETZAL, alwaysAuthentic(),
+                        Provider.ANDINA, alwaysAuthentic(),
+                        Provider.AUSTRAL, alwaysAuthentic()),
                 mappers(),
                 store,
                 Clock.fixed(QUETZAL_NOW, ZoneOffset.UTC));
@@ -116,7 +120,9 @@ class NotificationIntakeTest {
     @Test
     void authenticityIsCheckedBeforeThePayloadIsParsed() {
         NotificationIntake intake = new NotificationIntake(
-                Map.of(Provider.QUETZAL, alwaysRejected(), Provider.ANDINA, alwaysRejected()),
+                Map.of(Provider.QUETZAL, alwaysRejected(),
+                        Provider.ANDINA, alwaysRejected(),
+                        Provider.AUSTRAL, alwaysRejected()),
                 mappers(),
                 store,
                 Clock.fixed(QUETZAL_NOW, ZoneOffset.UTC));
@@ -149,14 +155,18 @@ class NotificationIntakeTest {
         return new NotificationIntake(
                 Map.of(
                         Provider.QUETZAL, new QuetzalSignatureVerifier(Fixtures.SECRETS, clock),
-                        Provider.ANDINA, new AndinaSignatureVerifier(Fixtures.SECRETS, clock)),
+                        Provider.ANDINA, new AndinaSignatureVerifier(Fixtures.SECRETS, clock),
+                        Provider.AUSTRAL, new AustralSignatureVerifier(Fixtures.SECRETS)),
                 mappers(),
                 store,
                 clock);
     }
 
     private static List<CanonicalEventMapper> mappers() {
-        return List.of(new QuetzalCanonicalEventMapper(), new AndinaCanonicalEventMapper());
+        return List.of(
+                new QuetzalCanonicalEventMapper(),
+                new AndinaCanonicalEventMapper(),
+                new AustralCanonicalEventMapper());
     }
 
     private static SignatureVerifier alwaysAuthentic() {

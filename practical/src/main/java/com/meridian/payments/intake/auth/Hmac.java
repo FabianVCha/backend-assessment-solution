@@ -27,6 +27,17 @@ final class Hmac {
         }
     }
 
+    /** HMAC-SHA256 over the raw body, for a provider that signs no timestamp. */
+    static byte[] hmacSha256(byte[] key, byte[] body) {
+        try {
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(key, "HmacSHA256"));
+            return mac.doFinal(body);
+        } catch (NoSuchAlgorithmException | InvalidKeyException e) {
+            throw new IllegalStateException("HmacSHA256 is unavailable", e);
+        }
+    }
+
     static boolean constantTimeEquals(byte[] expected, byte[] provided) {
         return MessageDigest.isEqual(expected, provided);
     }

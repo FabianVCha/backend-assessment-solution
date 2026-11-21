@@ -1,10 +1,15 @@
 openapi: 3.1.1
 info:
   title: Premium Payment Notifications - provider webhook intake
-  version: 1.0.0
+  version: 1.1.0
   license: {name: Proprietary}
   description: |
-    Quetzal Pagos (MX) and Andina Pay (CO). Austral (CL) is out of scope for Part B.
+    Quetzal Pagos (MX), Andina Pay (CO) and Austral Pagos (CL).
+
+    Version 1.1.0 adds Austral as a product extension: the original exercise covered Mexico and
+    Colombia, and the canonical event schema already declared CL, CLP and AUSTRAL because the design
+    covered three countries. The addition is additive — a new path and a new request schema, no change
+    to the two existing paths and no change to the canonical event.
 
     Authenticity is a per-provider HMAC over the raw request bytes, verified before parsing.
     A 2xx means the inbox row and both outbox jobs (SALESFORCE, CANONICAL_EVENT) committed in
@@ -70,6 +75,36 @@ paths:
         '413': {$ref: '#/components/responses/Rejected'}
         '503': {$ref: '#/components/responses/StoreUnavailable'}
       x-provider: {name: ANDINA, country: CO, api-version: '2.3', timeout-seconds: 5, success: ['200', '204'], max-body-bytes: 65536}
+  /webhooks/cl/austral:
+    post:
+      operationId: receiveAustralNotification
+      summary: Austral Pagos payment event (Chile, product extension)
+      description: |
+        Any 2xx is success; a non-2xx is retried up to 8 times within 48 hours, and the provider waits
+        10 s. Every retry carries the same eventId and an identical body, so a repeat is answered 200
+        with DUPLICATE and creates no new event and no outbox job.
+
+        Austral signs no timestamp, so there is no skew window: a replay is detected by event_id, which
+        the inbox enforces with its unique (provider, event_id). Ordering is not guaranteed by the
+        provider, which is why status_changed_at — payment.occurredAt — is the only timestamp that may
+        order events, never arrival time.
+
+        CLP has no minor unit: an amount of "45990" is amount_minor 45990 with currency_exponent 0.
+      parameters:
+        - $ref: '#/components/parameters/AustralSignature'
+      requestBody:
+        required: true
+        description: Bytes as received. The HMAC covers exactly these bytes, so parse that same buffer.
+        content: {application/json: {schema: {$ref: '#/components/schemas/AustralEvent'}}}
+      responses:
+        '200': {$ref: '#/components/responses/Accepted'}
+        '400': {$ref: '#/components/responses/Rejected'}
+        '401':
+          description: Signature missing, malformed or mismatched. No timestamp is signed, so no skew check applies.
+          content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+        '413': {$ref: '#/components/responses/Rejected'}
+        '503': {$ref: '#/components/responses/StoreUnavailable'}
+      x-provider: {name: AUSTRAL, country: CL, api-version: '2026-01', timeout-seconds: 10, success: ['200'], max-body-bytes: 65536}
 components:
   parameters:
     QuetzalSignature:
@@ -100,6 +135,16 @@ components:
         keyed with the merchant secret. Not hex, not URL-safe, one value only. Constant-time
         compare.
       schema: {type: string, pattern: '^[A-Za-z0-9+/]{43}=$', examples: ['JhaBZfk7eQsoMbbQbThmAx/bCyehBOzKYw8XTP2a40k=']}
+    AustralSignature:
+      name: X-Austral-Signature
+      in: header
+      required: true
+      description: |
+        Lowercase hex HMAC-SHA256 of the raw body, keyed with the merchant webhook secret. Exactly 64
+        lowercase hex characters; uppercase is rejected as malformed. Nothing time-bound is signed, so
+        there is no tolerance window and replay protection is the event identity, not the clock.
+        Constant-time compare.
+      schema: {type: string, pattern: '^[0-9a-f]{64}$', examples: ['ec52aeac3cbb26dbb1650a46ea82fd44c38f99dd6705e7ab413b2704e1482357']}
   headers:
     RetryAfter:
       description: Suggested minimum delay in seconds.
@@ -193,3 +238,24 @@ components:
             fecha_transaccion: {type: string, format: date-time, description: 'State-change time with offset. The only timestamp ordering may use.'}
             motivo_reverso: {type: string, maxLength: 64}
             pagador: {type: object, additionalProperties: true, x-pii: true, description: 'Payer data. Never read, logged or persisted.'}
+    AustralEvent:
+      type: object
+      description: |
+        Austral Pagos. Unknown fields are ignored, never rejected, for the same reason as the other two.
+      required: [eventId, eventType, sentAt, payment]
+      additionalProperties: true
+      properties:
+        eventId: {type: string, maxLength: 128, description: 'Stable across retries. The event key, because the signature carries no timestamp.'}
+        eventType: {enum: [PAYMENT_CONFIRMED, PAYMENT_REJECTED, PAYMENT_REVERSED]}
+        sentAt: {type: string, format: date-time, description: 'Send time. Becomes occurred_at; ordering never uses it.'}
+        payment:
+          type: object
+          additionalProperties: true
+          required: [paymentId, amount, currency, policyNumber, occurredAt]
+          properties:
+            paymentId: {type: string, maxLength: 128, description: 'Business payment identity; becomes payment_key.'}
+            amount: {type: string, pattern: '^[0-9]{1,13}$', description: 'Integer amount as a string. CLP has no minor unit: "45990" becomes amount_minor 45990 with currency_exponent 0.'}
+            currency: {type: string, pattern: '^CLP$'}
+            policyNumber: {type: string, pattern: '^POL-CL-[0-9]{9}$'}
+            occurredAt: {type: string, format: date-time, description: 'State-change time. The only timestamp ordering may use.'}
+            payer: {type: object, additionalProperties: true, x-pii: true, description: 'Payer data. Never read, logged or persisted.'}
