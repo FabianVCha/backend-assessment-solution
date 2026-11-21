@@ -97,7 +97,7 @@
     "refund_scope": {
       "type": ["string", "null"],
       "enum": ["FULL", "PARTIAL", "UNKNOWN", null],
-      "description": "Only when status is REFUNDED. Compares the reported amount in this notification with amount_minor: FULL when equal, PARTIAL when lower, UNKNOWN when there is no reported amount. It is not a statement about the charge's historical refunded total. Andina and Austral report no amount and no extent, so their scope is UNKNOWN, and UNKNOWN is not PARTIAL."
+      "description": "Only when status is REFUNDED. Compares the reported amount in this notification with amount_minor: FULL when equal, PARTIAL when lower, UNKNOWN when there is no reported amount or when the reported figure is above amount_minor and the comparison is not interpretable. It is not a statement about the charge's historical refunded total. Andina and Austral report no amount and no extent, so their scope is UNKNOWN, and UNKNOWN is not PARTIAL."
     },
     "status_changed_at": {
       "$ref": "#/$defs/utcInstant",
@@ -166,7 +166,7 @@
       "then": { "$ref": "#/$defs/refundFieldsNull" }
     },
     {
-      "description": "A reported refunded amount is always marked as provider-reported and unspecified, and its scope is a comparison with this payment, never a historical total.",
+      "description": "A reported refunded amount is always marked as provider-reported and unspecified, and its scope is a comparison with this payment, never a historical total. The scope is UNKNOWN when the reported figure is above the charge amount: the comparison is not interpretable, and the figure is still carried as reported rather than corrected.",
       "if": {
         "properties": {
           "status": { "const": "REFUNDED" },
@@ -176,7 +176,7 @@
       "then": {
         "properties": {
           "refunded_amount_semantics": { "const": "PROVIDER_REPORTED_UNSPECIFIED" },
-          "refund_scope": { "enum": ["FULL", "PARTIAL"] }
+          "refund_scope": { "enum": ["FULL", "PARTIAL", "UNKNOWN"] }
         }
       }
     },
