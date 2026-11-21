@@ -1,0 +1,194 @@
+openapi: 3.1.1
+info:
+  title: Premium Payment Notifications - provider webhook intake
+  version: 1.0.0
+  license: {name: Proprietary}
+  description: |
+    Quetzal Pagos (MX) and Andina Pay (CO). Austral (CL) is out of scope for Part B.
+
+    Authenticity is a per-provider HMAC over the raw request bytes, verified before parsing.
+    A 2xx means the inbox row and both outbox jobs (SALESFORCE, CANONICAL_EVENT) committed in
+    one transaction. The broker publish happens afterwards and is not part of this response.
+    No path returns 202, because the response is a durability fact and not an intent.
+    Part B stubs store and broker behind interfaces; the acceptance point does not move.
+
+    Canonical event schema: docs/api/events/premium-payment.schema.json.
+servers:
+  - url: https://api.meridian.example
+    description: Placeholder host, reserved domain.
+security: []
+paths:
+  /webhooks/mx/quetzal:
+    post:
+      operationId: receiveQuetzalNotification
+      summary: Quetzal Pagos charge event
+      description: |
+        Any 2xx is success, anything else is retried for up to 3 days, provider timeout 10 s.
+        A retry carries the same id, so a duplicate is answered 200 with DUPLICATE and creates
+        no outbox job and no republication. Checks in order: size 413, signature 401, JSON and
+        schema 400, transaction 503.
+      parameters:
+        - $ref: '#/components/parameters/QuetzalSignature'
+      requestBody:
+        required: true
+        description: Bytes as received. The HMAC covers them, so parse that same buffer.
+        content: {application/json: {schema: {$ref: '#/components/schemas/QuetzalEvent'}}}
+      responses:
+        '200': {$ref: '#/components/responses/Accepted'}
+        '400': {$ref: '#/components/responses/Rejected'}
+        '401':
+          description: Signature missing, malformed or mismatched, or skew beyond 300 s.
+          content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+        '413': {$ref: '#/components/responses/Rejected'}
+        '503': {$ref: '#/components/responses/StoreUnavailable'}
+      x-provider: {name: QUETZAL, country: MX, api-version: '2025-06-01', timeout-seconds: 10, success: ['200'], max-body-bytes: 65536}
+  /webhooks/co/andina:
+    post:
+      operationId: receiveAndinaNotification
+      summary: Andina Pay transaction notification
+      description: |
+        Only 200 or 204 is success, anything else is a failure, provider timeout 5 s.
+        Every retry is a new notification with a new notificacion_id, so the business event is
+        transaccion.id + estado + fecha_transaccion and event_id is derived from that triple.
+        200 with a receipt on first acceptance, 204 with no body on a duplicate.
+      parameters:
+        - $ref: '#/components/parameters/AndinaTimestamp'
+        - $ref: '#/components/parameters/AndinaSignature'
+      requestBody:
+        required: true
+        description: Bytes as received. The signature covers the timestamp value, a dot, these bytes.
+        content: {application/json: {schema: {$ref: '#/components/schemas/AndinaNotification'}}}
+      responses:
+        '200': {$ref: '#/components/responses/Accepted'}
+        '204':
+          description: Duplicate business event. No content, no outbox job, no republication.
+        '400': {$ref: '#/components/responses/Rejected'}
+        '401':
+          description: Signature missing, malformed or mismatched, or skew beyond 600 s.
+          content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+        '413': {$ref: '#/components/responses/Rejected'}
+        '503': {$ref: '#/components/responses/StoreUnavailable'}
+      x-provider: {name: ANDINA, country: CO, api-version: '2.3', timeout-seconds: 5, success: ['200', '204'], max-body-bytes: 65536}
+components:
+  parameters:
+    QuetzalSignature:
+      name: Quetzal-Signature
+      in: header
+      required: true
+      description: |
+        t=<unix_seconds>,v1=<hex>, optional repeated v1 during rotation, no spaces. v1 is the
+        lowercase hex HMAC-SHA256 of "<t>.<raw_body>" keyed with the webhook secret, where raw
+        body means the bytes as received, never a re-serialised document. Any matching v1 is
+        valid. Constant-time compare. Reject beyond 300 s with TIMESTAMP_OUT_OF_TOLERANCE.
+      schema: {type: string, pattern: '^t=[0-9]{10}(,v1=[0-9a-f]{64})+$', examples: ['t=1795888803,v1=2d07770582c02f15235ac4e027b7732beef86be103c574a1c3b988a4275f5031']}
+    AndinaTimestamp:
+      name: X-Andina-Timestamp
+      in: header
+      required: true
+      description: |
+        ISO-8601 with offset, used byte for byte as received because it is part of the signed
+        string. Never reformatted or converted to UTC before hashing. Reject beyond 600 s with
+        TIMESTAMP_OUT_OF_TOLERANCE.
+      schema: {type: string, pattern: '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,9})?(Z|[+-][0-9]{2}:[0-9]{2})$', examples: ['2026-11-28T14:02:59-05:00']}
+    AndinaSignature:
+      name: X-Andina-Signature
+      in: header
+      required: true
+      description: |
+        Standard padded Base64 of the HMAC-SHA256 of "<X-Andina-Timestamp value>.<raw_body>",
+        keyed with the merchant secret. Not hex, not URL-safe, one value only. Constant-time
+        compare.
+      schema: {type: string, pattern: '^[A-Za-z0-9+/]{43}=$', examples: ['JhaBZfk7eQsoMbbQbThmAx/bCyehBOzKYw8XTP2a40k=']}
+  headers:
+    RetryAfter:
+      description: Suggested minimum delay in seconds.
+      schema: {type: integer, minimum: 1}
+  responses:
+    Accepted:
+      description: Accepted and durable, or already accepted. No new outbox job either way.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Receipt'}
+          examples:
+            accepted: {value: {status: ACCEPTED}}
+            duplicate: {value: {status: DUPLICATE}}
+    Rejected:
+      description: Authentic bytes, unusable notification. Bad JSON, schema violation, or an unmappable reference. Retrying cannot succeed.
+      content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+    StoreUnavailable:
+      description: Store unavailable, nothing committed. The provider retry carries durability.
+      headers:
+        Retry-After: {$ref: '#/components/headers/RetryAfter'}
+      content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+  schemas:
+    Receipt: {type: object, required: [status], additionalProperties: false, description: 'No payer data, amount, policy number or signature.', properties: {status: {enum: [ACCEPTED, DUPLICATE]}}}
+    Error:
+      type: object
+      required: [error]
+      additionalProperties: false
+      description: message is a fixed sentence and never echoes the body or a signature.
+      properties:
+        error:
+          type: object
+          required: [code, message, retryable]
+          additionalProperties: false
+          properties:
+            code: {enum: [MALFORMED_JSON, SCHEMA_VALIDATION_FAILED, POLICY_REFERENCE_UNPARSEABLE, SIGNATURE_HEADER_MISSING, SIGNATURE_HEADER_MALFORMED, SIGNATURE_INVALID, TIMESTAMP_OUT_OF_TOLERANCE, PAYLOAD_TOO_LARGE, STORE_UNAVAILABLE, INTERNAL_ERROR]}
+            message: {type: string, maxLength: 200}
+            retryable: {type: boolean}
+    QuetzalEvent:
+      type: object
+      description: |
+        Quetzal 2025-06-01. Unknown provider fields are ignored, never rejected, so an additive
+        provider change cannot become a permanent 400.
+      required: [id, type, created, data]
+      additionalProperties: true
+      properties:
+        id: {type: string, maxLength: 128, description: 'Stable across retries, the event key.'}
+        type: {enum: [charge.succeeded, charge.failed, charge.refunded]}
+        api_version: {type: string, maxLength: 32, description: 'Provider API version as sent, for example 2025-06-01. Informational only: not pinned to a value and never part of an identity, so a provider version bump is not a rejected payment.'}
+        created: {type: integer, minimum: 1, description: 'Unix seconds, becomes occurred_at.'}
+        data:
+          type: object
+          additionalProperties: true
+          required: [charge]
+          properties:
+            charge:
+              type: object
+              additionalProperties: true
+              required: [id, amount, currency, reference]
+              properties:
+                id: {type: string, maxLength: 128}
+                amount: {type: integer, minimum: 1, description: 'Minor units. 125000 is MXN 1,250.00 and is already amount_minor.'}
+                amount_refunded: {type: integer, minimum: 1, description: 'Only on charge.refunded. Carried as reported, never summed.'}
+                currency: {type: string, pattern: '^[a-z]{3}$', description: 'Lowercase ISO 4217 as sent. Canonical uppercases it.'}
+                status: {enum: [succeeded, failed, refunded]}
+                failure_code: {type: string, maxLength: 64}
+                reference: {type: string, maxLength: 40}
+                paid_at: {type: [integer, 'null']}
+                refunded_at: {type: [integer, 'null']}
+                payment_method: {type: object, additionalProperties: true, description: 'Token only, no card data.'}
+                customer: {type: object, additionalProperties: true, x-pii: true, description: 'Payer data. Never read, logged or persisted.'}
+    AndinaNotification:
+      type: object
+      description: |
+        Andina 2.3. Unknown fields are ignored, never rejected, for the same reason.
+      required: [notificacion_id, fecha_notificacion, transaccion]
+      additionalProperties: true
+      properties:
+        notificacion_id: {type: string, maxLength: 128, description: 'Per attempt only, changes on retry, never the event key.'}
+        fecha_notificacion: {type: string, format: date-time, description: 'Send time with offset, becomes occurred_at in UTC.'}
+        transaccion:
+          type: object
+          additionalProperties: true
+          required: [id, estado, valor, moneda, referencia, fecha_transaccion]
+          properties:
+            id: {type: string, maxLength: 128}
+            estado: {enum: [PENDIENTE, APROBADA, RECHAZADA, REVERSADA]}
+            valor: {type: string, pattern: '^[0-9]{1,13}[.][0-9]{2}$', description: 'Major units as a string. 185000.00 is COP 185,000.00 and becomes 18500000 minor. Never a float.'}
+            moneda: {type: string, pattern: '^[A-Z]{3}$'}
+            referencia: {type: string, maxLength: 40}
+            medio_pago: {enum: [PSE, TARJETA, EFECTIVO]}
+            fecha_transaccion: {type: string, format: date-time, description: 'State-change time with offset. The only timestamp ordering may use.'}
+            motivo_reverso: {type: string, maxLength: 64}
+            pagador: {type: object, additionalProperties: true, x-pii: true, description: 'Payer data. Never read, logged or persisted.'}
