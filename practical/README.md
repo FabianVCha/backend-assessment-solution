@@ -10,8 +10,8 @@ deliverable: no real provider, Salesforce org or broker is called.
 - networknt json-schema-validator 2.0.8, **test scope only**: the conformance test validates the
   events this code produces against `docs/api/events/premium-payment.schema.json`. The schema is
   read from the repository, never copied, so a changed contract cannot keep passing unnoticed.
-- Plain Java libraries, no framework. The components have no HTTP or dependency injection coupling
-  yet.
+- Plain Java libraries, no framework. The HTTP surface is a handler with no server and no framework
+  attached yet.
 
 ## Build and test
 
@@ -45,6 +45,10 @@ practical/
     NotificationIntake.java          authenticity, then event, then durability
     IntakeOutcome.java               ACCEPTED or DUPLICATE, with the event
     WebhookRejectedException.java    not authentic, not read
+    http/
+      WebhookEndpoint.java           the two published paths and their status codes
+      HttpRequest.java               path, headers and raw body
+      HttpResponse.java              status, headers and body
     auth/
       Provider.java                  provider enum
       WebhookRequest.java            provider + headers + raw body bytes
@@ -64,16 +68,27 @@ practical/
       AndinaCanonicalEventMapper.java
     store/
       IntakeStore.java               persistence boundary
+      OutboxStore.java               outbox drained per destination
       InMemoryIntakeStore.java       in-memory inbox and outbox, one transaction
       Acceptance.java                ACCEPTED or DUPLICATE
       OutboxJob.java                 one unit of work per destination
+      PendingJob.java                a job with the event it carries
       Destination.java               SALESFORCE and CANONICAL_EVENT
       StoreUnavailableException.java nothing was written
+    publish/
+      CanonicalEventPublisher.java   drains CANONICAL_EVENT into the topic
+      Broker.java                    broker boundary
+      RecordingBroker.java           stub that records, and can fail or lose an ack
+      CanonicalMessage.java          message id, correlation id and body
+      MessageIds.java                the derived, stable message id
+      BrokerUnavailableException.java the ack never came
   src/test/java/com/meridian/payments/intake/
     TestSamples.java                 published samples and the schema path
     NotificationIntakeTest.java      the whole path with the real pieces
     auth/                            signature tests
     store/InMemoryIntakeStoreTest.java
+    publish/CanonicalEventPublisherTest.java
+    http/WebhookEndpointTest.java
     canonical/
       CanonicalEventContractTest.java       produced events against the published schema
       QuetzalCanonicalEventMapperTest.java
@@ -162,9 +177,42 @@ succeeded. That is what lets the injected failures prove the atomicity claim: th
 store fail before the transaction and in the middle of it, and assert that nothing survives either
 time.
 
+## Implemented: publication to the canonical topic (FR6)
+
+`publish.CanonicalEventPublisher` drains the `CANONICAL_EVENT` outbox job into the topic, in batches:
+
+- `MessageId` is `provider + ":" + event_id` when that fits in the 128-character broker limit, and
+  `"sha256:" + hex(sha256(provider + "|" + event_id))` otherwise. Hashing rather than truncating,
+  because two long identities could otherwise collide and a collision silently drops a payment.
+- `CorrelationId` is the canonical `correlation_id`, identical on every retry.
+- A job is marked published only after the broker acknowledged it. A lost acknowledgement leaves it
+  pending, so the next poll publishes the same event again with the same `MessageId`: publication is
+  at-least-once and consumers deduplicate on `(provider, event_id)`.
+- The publisher touches that destination only. The `SALESFORCE` job stays for a separate relay, so a
+  broker outage cannot delay Salesforce and a Salesforce outage cannot delay publication.
+
+## Implemented: HTTP surface
+
+`http.WebhookEndpoint` is the handler for the two paths the contract publishes, and it decides nothing
+the contract has not decided:
+
+| Situation | Answer |
+|---|---|
+| body over 64 KiB | `413` `PAYLOAD_TOO_LARGE`, before the signature is looked at |
+| signature missing, malformed, wrong or stale | `401` with the signature failure code |
+| authentic but unusable payload | `400` with `MALFORMED_JSON`, `SCHEMA_VALIDATION_FAILED` or `POLICY_REFERENCE_UNPARSEABLE` |
+| store could not commit | `503` `STORE_UNAVAILABLE` with `Retry-After: 5` |
+| first acceptance | `200` `{"status":"ACCEPTED"}` |
+| duplicate | Quetzal: `200` `{"status":"DUPLICATE"}`; Andina: `204` with no body |
+| any other path | `404` |
+
+Two deliberate omissions: no `202` on any path, because the `2xx` is a durability fact and not an
+intent; and no content-type gate, because the contract declares a JSON body and its error vocabulary
+has no code for an unsupported media type, so inventing one would break the contract it implements.
+
 ## Tests and evidence
 
-102 JUnit 5 tests.
+117 JUnit 5 tests.
 
 Authentication (51):
 
@@ -199,30 +247,54 @@ Store and intake (11):
   authenticity is checked before parsing, and a store failure reaches the caller instead of becoming
   a false 2xx.
 
+Publisher (7):
+
+- a pending event is published with the derived `MessageId` and the canonical correlation id;
+- a published job is not published again;
+- a long identity becomes a stable hash instead of a truncated id;
+- a broker failure leaves the job pending with an attempt recorded, and the next poll publishes it;
+- a lost acknowledgement publishes the same message again, with the same `MessageId`;
+- the `SALESFORCE` destination is never touched by the publisher;
+- the batch size is respected.
+
+HTTP surface (8):
+
+- an accepted notification is a `200` with the receipt; a Quetzal duplicate is a `200` `DUPLICATE`;
+  an Andina duplicate is a `204` with no body;
+- an oversized body is a `413` before the signature is looked at;
+- a bad signature is a `401` and a non-retryable error;
+- an unmappable reference is a `400` with its own code and no echo of the request;
+- a store failure is a `503` with `Retry-After`;
+- an unpublished path is a `404`.
+
 RED/GREEN evidence was captured from the container build for the first two lots:
 
 - authentication: 51 tests, 50 failing before the implementation (assertion failures, no compilation
   error), then 51 passing;
 - canonical mapping: 90 tests, 39 failing before the implementation (11 failures and 28 errors, all
-  `NOT_IMPLEMENTED`, no compilation error), then 91 passing with `BUILD SUCCESS`.
+  `NOT_IMPLEMENTED`, no compilation error), then 91 passing.
 
-The store and intake lot was written together with its tests, so it has no red-phase capture; its
-evidence is the full suite green plus the injected-failure cases above.
+The store, publisher and HTTP lots were written together with their tests, so they have no red-phase
+capture; their evidence is the full suite green plus the injected failures above.
 
 ## Stubbed
 
 - Secrets: in-memory provider; the design reads Azure Key Vault.
-- Store: in-memory implementation behind `IntakeStore`; the design puts PostgreSQL behind it, with
-  the same unique constraint and the same transaction boundary.
-- Broker and Salesforce: interfaces in the design, not implemented yet. The outbox rows are written,
-  but nothing drains them.
+- Store: in-memory implementation behind `IntakeStore` and `OutboxStore`; the design puts PostgreSQL
+  behind them, with the same unique constraint and the same transaction boundary.
+- Broker: recording implementation behind `Broker`; the design puts Azure Service Bus behind it.
+- Salesforce: not called anywhere. The `SALESFORCE` job is recorded for a relay that is out of scope
+  for this part, as the task states.
 
 ## Known gaps
 
-- No HTTP server: the size limit, the content-type check, the translation of a failure code to
-  `400`/`401`/`413`/`503` and the receipt bodies belong to the next lot.
-- No publisher: the `CANONICAL_EVENT` job is recorded and never sent, and `MessageId` is not built yet.
+- No server process: `WebhookEndpoint` is a handler with no framework or runtime adapter attached, so
+  nothing listens on a port. The contract, the status codes and the bodies are complete and tested.
+- No scheduler: `publishPending()` runs when it is called. There is no poll timer, no backoff curve
+  and no dead-letter rule for a job that keeps failing; those belong with the infrastructure.
 - No relay to Salesforce: the `SALESFORCE` job is recorded and never processed, so no batching, no
-  backoff and no dead letter.
+  backoff and no dead letter on that path.
+- Content-type is not gated, on purpose: the contract declares a JSON body and its error enum has no
+  code for an unsupported media type.
 - `paid_at` and `refunded_at` fall back to `created` when absent. A stricter reading would reject
   those notifications instead; the trade-off is revisited when the store owns the atomicity.
