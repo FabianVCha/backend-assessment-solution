@@ -97,6 +97,9 @@ practical/
       SalesforceRelay.java           one batch, classified: applied, terminal, held or retry
       SalesforceRelayLoop.java       the tick that drains the lane without a human
       SimulatedSalesforce.java       scripted destination, so the fault matrix is tested
+    ops/
+      ReplayCli.java                 queues one job from a local operator command
+      ReplayService.java             records the decision and resets just that job
     store/
       SalesforceStore.java           the lane's endings: applied, terminal, ambiguous
       PostgresSalesforceStore.java   claiming, ordering by the provider clock, three endings
@@ -107,6 +110,7 @@ practical/
     V3__payment_state.sql            the projection keyed by payment, not by notification
     V4__salesforce_lane.sql          DEAD and HELD, the outcome code and the in-flight index
     V5__salesforce_budget.sql        UTC counters and admission times for the rolling window
+    V6__replay.sql                   replay submissions, their justifications and outcomes
   src/test/java/com/meridian/payments/intake/
     TestSamples.java                 published samples and the schema path
     MutableClock.java                a clock the tests move by hand
@@ -351,6 +355,30 @@ slot but still counts as a call. A remote `403` retains its existing `RATE_LIMIT
 The client is `SimulatedSalesforce`: the fault matrix is scripted per test and no real Salesforce call is
 made anywhere in this repository. The port is the seam where a real client goes.
 
+## Implemented: replay one destination
+
+From `practical/`, build the runnable jar with `mvn package`. With `INTAKE_JDBC_URL`,
+`INTAKE_DB_USER` and `INTAKE_DB_PASSWORD` set as for intake, run:
+
+```sh
+java -cp target/payment-notification-intake.jar com.meridian.payments.intake.ops.ReplayCli \
+  ANDINA '<event-id>' SALESFORCE 'INC-0412: policy reference corrected' '<requester>' '<unique-key>'
+```
+
+Use the stored provider/event ID and `SALESFORCE` or `CANONICAL_EVENT`. `REQUEUED` exits 0;
+a rejected command prints its outcome and exits 1; usage, configuration or database errors exit 2.
+The command needs a nonblank requester, reason and key. Reusing a key for the same target returns
+the first outcome without applying the reset again, even if the first command was rejected. The
+same key for a different provider, event or destination returns `KEY_TARGET_CONFLICT` without
+changing the audit or the queue. Use a new key only for a new operator decision.
+
+`replay_command` records the requested target, requester, reason, time, key and queue outcome.
+`REQUEUED` means the existing job is due again (`PENDING` / `REPLAY`, zero attempts), not that the
+destination applied it. Replay refuses a `CLAIMED` job, including one whose lease expired; the
+worker's normal claim path handles expiry. The immutable event and its other destination do not
+change. The Salesforce relay still skips an older event as `STALE_SKIPPED`. A replay of a `HELD`
+job is an explicit operator choice: reconcile the ambiguous write before requesting it.
+
 ## Running it
 
 Two profiles. The durable one needs nothing but Docker:
@@ -389,7 +417,7 @@ store is no longer one of them.
 
 ## Tests and evidence
 
-190 JUnit 5 tests: 158 need nothing but a JVM, and 32 more run against a real PostgreSQL when
+199 JUnit 5 tests: 158 need nothing but a JVM, and 41 more run against a real PostgreSQL when
 `INTAKE_IT_JDBC_URL` is set (CI sets it, so they are a gate and not a local habit).
 
 Authentication (51):
@@ -448,6 +476,15 @@ Salesforce lane (15, against a database and a scripted destination):
 - capacity is reserved before a write and released after it or a client exception; the rolling
   limit defers the whole batch, and in-flight work still counts after UTC midnight;
 - two replicas racing for the last call or in-flight slot admit exactly one write.
+
+Replay (9, against PostgreSQL):
+
+- a dead job is made due again without creating an event or disturbing the other destination;
+- a missing reason is rejected and the first outcome for a key is retained;
+- a claimed job is not reset, even if the lease expired;
+- a replayed older event is skipped without a remote write or a change to the applied status;
+- the CLI rejects unknown destinations, unknown events, and reuse of a key for another target;
+- concurrent duplicate requests reset once, and an audit failure rolls back the whole command.
 
 Store and intake (16):
 
@@ -526,6 +563,9 @@ no red-phase capture; their evidence is the full suite green plus the injected f
   internal refreshes or retries and for other consumers of the same Salesforce quota. A process
   killed during a call can leave an in-flight reservation; there is no automatic reclamation.
   Admission history has no retention job yet.
+- Replay is a JDBC operator tool, not an authenticated service. The requester is supplied by the
+  caller; access and identity must be controlled outside the CLI. The audit records the queue
+  reset, not the eventual delivery outcome.
 - Content-type is not gated, on purpose: the contract declares a JSON body and its error enum has no
   code for an unsupported media type.
 - `paid_at` and `refunded_at` fall back to `created` when absent. A stricter reading would reject
