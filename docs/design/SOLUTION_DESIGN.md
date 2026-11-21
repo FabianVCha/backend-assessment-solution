@@ -223,7 +223,7 @@ canonical event. It is not needed to record a payment and NFR6 forbids it in log
 
 | Canonical field | Quetzal (MX) | Andina (CO) | Austral (CL) |
 |---|---|---|---|
-| `event_id` | `id` (stable across retries) | derived: `transaccion.id` + `transaccion.estado` + `transaccion.fecha_transaccion` (there is no stable event id) | `eventId` |
+| `event_id` | `id` (stable across retries) | derived: `transaccion.id` + `transaccion.estado` (there is no stable event id; the pair is what the provider keeps stable across attempts) | `eventId` |
 | `payment_key` | `QZ-MX-<data.charge.id>` | `AN-CO-<transaccion.id>` | `AU-CL-<payment.paymentId>` |
 | `provider_transaction_id` | `data.charge.id` | `transaccion.id` | `payment.paymentId` |
 | `policy_number` | `data.charge.reference` | `transaccion.referencia` | `payment.policyNumber` |
@@ -362,11 +362,14 @@ Andina's and Austral's absent amount and extent — stay explicit in §3.2 and a
 
 **Level 1 — event deduplication (store).** `payment_event` has a unique index on
 `(provider, event_id)`. Andina's derived key is a SHA-256 over
-`transaccion.id | transaccion.estado | transaccion.fecha_transaccion`, because the provider gives no
-stable event identifier. Enforcement is an insert-and-catch: the intake service inserts and treats a
-unique violation as success. There is no `SELECT` before the insert, so two simultaneous deliveries
-of the same event cannot both pass. `provider` is part of the key because provider event ids are only
-unique inside one provider: the same string from Quetzal and Austral is two different events.
+`transaccion.id | transaccion.estado`, because the provider gives no stable event identifier and
+states that this pair identifies the business event and does not change between attempts.
+`transaccion.fecha_transaccion` is deliberately excluded: the provider never promises that it is
+stable, so including it could turn one retried event into two. Enforcement is an insert-and-catch:
+the intake service inserts and treats a unique violation as success. There is no `SELECT` before the
+insert, so two simultaneous deliveries of the same event cannot both pass. `provider` is part of
+the key because provider event ids are only unique inside one provider: the same string from
+Quetzal and Austral is two different events.
 
 **Level 2 — business upsert (Salesforce).** `Payment_Key__c` is derived from the provider's
 **payment** identifier, never from the event. `Premium_Payment__c` is upserted on that external ID,

@@ -1,0 +1,215 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.meridian.example/payments/premium-payment/1.0.0",
+  "title": "Canonical premium payment event",
+  "description": "Provider-independent payment event published on the canonical topic (FR2, FR6). It is a valid, accepted and deduplicated notification carrying the state the provider reported at status_changed_at. It is not proof that Salesforce applied that state and not proof that any consumer processed it. Payer personal data is absent by design (NFR6); payment, policy and provider identifiers remain sensitive and are handled under the operations access model.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "event_id",
+    "provider",
+    "country",
+    "payment_key",
+    "provider_transaction_id",
+    "policy_number",
+    "amount_minor",
+    "currency",
+    "currency_exponent",
+    "status",
+    "refunded_amount_minor",
+    "refunded_amount_semantics",
+    "refund_scope",
+    "status_changed_at",
+    "occurred_at",
+    "received_at",
+    "correlation_id",
+    "payload_hash"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0",
+      "description": "Event contract version, MAJOR.MINOR. Pinned to 1.0 by this document. Consumers switch on this value before validating: an unknown version is a routing decision, not a schema failure."
+    },
+    "event_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "The provider's own event identifier when it is stable across retries: Quetzal sends it in `id`. Andina sends a new `notificacion_id` on every attempt, so its event id is the SHA-256 of `transaccion.id | transaccion.estado`, the pair the provider states identifies the business event and does not change between attempts (design section 4.1). Unique only within one provider, so the event identity is the pair (provider, event_id)."
+    },
+    "provider": {
+      "type": "string",
+      "enum": ["QUETZAL", "ANDINA", "AUSTRAL"],
+      "description": "Provider that reported the event. Part B emits QUETZAL and ANDINA; AUSTRAL is in the contract because Part A defines all three, and dropping it would narrow the shared event."
+    },
+    "country": {
+      "type": "string",
+      "enum": ["MX", "CO", "CL"]
+    },
+    "payment_key": {
+      "type": "string",
+      "maxLength": 80,
+      "pattern": "^(QZ-MX|AN-CO|AU-CL)-[A-Za-z0-9._:-]{1,72}$",
+      "description": "External id Premium_Payment__c.Payment_Key__c. Identifies the payment, never the event, so the upsert on it is what makes the business guarantee exactly-once."
+    },
+    "provider_transaction_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80,
+      "description": "Provider charge, transaction or payment identifier. The FR7 lookup key, together with provider."
+    },
+    "policy_number": {
+      "type": "string",
+      "pattern": "^POL-(MX|CO|CL)-[0-9]{9}$",
+      "description": "Upper-case policy number, and the country segment must agree with country."
+    },
+    "amount_minor": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 10000000000,
+      "description": "Original payment amount in the currency's minor unit, always an integer and never a float. On a refund event this stays the original amount and is never replaced by the refunded figure. The upper bound is a sanity guard, not a business rule."
+    },
+    "currency": {
+      "type": "string",
+      "enum": ["MXN", "COP", "CLP"],
+      "description": "ISO 4217 in upper case. Providers send it in their own casing; the adapter is what normalises it."
+    },
+    "currency_exponent": {
+      "type": "integer",
+      "enum": [0, 2],
+      "description": "2 for MXN and COP, 0 for CLP. It carries the difference so a consumer can always render two decimals without a currency table."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["PENDING", "CAPTURED", "FAILED", "REFUNDED"]
+    },
+    "refunded_amount_minor": {
+      "type": ["integer", "null"],
+      "minimum": 1,
+      "maximum": 10000000000,
+      "description": "Amount the provider reported as refunded in this notification, same currency and minor unit as amount_minor. null when the provider reports no amount, and null is not 0: zero would be a figure the provider never stated. Never computed, accumulated or derived by the integration."
+    },
+    "refunded_amount_semantics": {
+      "type": ["string", "null"],
+      "enum": ["PROVIDER_REPORTED_UNSPECIFIED", null],
+      "description": "PROVIDER_REPORTED_UNSPECIFIED whenever a refunded amount is present: the provider reports a figure without stating whether it is cumulative for the charge or specific to this refund. The integration neither normalises nor accumulates it, and consumers must not sum refund events."
+    },
+    "refund_scope": {
+      "type": ["string", "null"],
+      "enum": ["FULL", "PARTIAL", "UNKNOWN", null],
+      "description": "Only when status is REFUNDED. Compares the reported amount in this notification with amount_minor: FULL when equal, PARTIAL when lower, UNKNOWN when there is no reported amount or when the reported figure is above amount_minor and the comparison is not interpretable. It is not a statement about the charge's historical refunded total. Andina and Austral report no amount and no extent, so their scope is UNKNOWN, and UNKNOWN is not PARTIAL."
+    },
+    "status_changed_at": {
+      "$ref": "#/$defs/utcInstant",
+      "description": "Time of the state change at the provider, never the time we received it. The only timestamp an ordering decision may use."
+    },
+    "occurred_at": {
+      "$ref": "#/$defs/utcInstant",
+      "description": "Event creation time when the provider exposes one."
+    },
+    "received_at": {
+      "$ref": "#/$defs/utcInstant",
+      "description": "Our clock. Used for monitoring and freshness only, never for ordering."
+    },
+    "correlation_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Propagated end to end (NFR7): the provider transaction id, or the event id when it is unique."
+    },
+    "payload_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Lower-case SHA-256 hex of the raw request body. It flags a mismatch against a known expected body; it does not reconstruct the payload and is not evidence on its own."
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "provider": { "const": "QUETZAL" } } },
+      "then": {
+        "properties": {
+          "country": { "const": "MX" },
+          "currency": { "const": "MXN" },
+          "currency_exponent": { "const": 2 },
+          "payment_key": { "pattern": "^QZ-MX-" },
+          "policy_number": { "pattern": "^POL-MX-[0-9]{9}$" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "provider": { "const": "ANDINA" } } },
+      "then": {
+        "properties": {
+          "country": { "const": "CO" },
+          "currency": { "const": "COP" },
+          "currency_exponent": { "const": 2 },
+          "payment_key": { "pattern": "^AN-CO-" },
+          "policy_number": { "pattern": "^POL-CO-[0-9]{9}$" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "provider": { "const": "AUSTRAL" } } },
+      "then": {
+        "properties": {
+          "country": { "const": "CL" },
+          "currency": { "const": "CLP" },
+          "currency_exponent": { "const": 0 },
+          "payment_key": { "pattern": "^AU-CL-" },
+          "policy_number": { "pattern": "^POL-CL-[0-9]{9}$" }
+        }
+      }
+    },
+    {
+      "description": "Refund fields exist only on a refund event. A CAPTURED, FAILED or PENDING event carries three nulls, so no consumer can read a refund that never happened.",
+      "if": { "properties": { "status": { "enum": ["PENDING", "CAPTURED", "FAILED"] } } },
+      "then": { "$ref": "#/$defs/refundFieldsNull" }
+    },
+    {
+      "description": "A reported refunded amount is always marked as provider-reported and unspecified, and its scope is a comparison with this payment, never a historical total. The scope is UNKNOWN when the reported figure is above the charge amount: the comparison is not interpretable, and the figure is still carried as reported rather than corrected.",
+      "if": {
+        "properties": {
+          "status": { "const": "REFUNDED" },
+          "refunded_amount_minor": { "type": "integer" }
+        }
+      },
+      "then": {
+        "properties": {
+          "refunded_amount_semantics": { "const": "PROVIDER_REPORTED_UNSPECIFIED" },
+          "refund_scope": { "enum": ["FULL", "PARTIAL", "UNKNOWN"] }
+        }
+      }
+    },
+    {
+      "description": "A refund reported without an amount stays unknown: semantics null and scope UNKNOWN. This is the Andina and Austral shape, and it must never be rendered as a full refund or as zero.",
+      "if": {
+        "properties": {
+          "status": { "const": "REFUNDED" },
+          "refunded_amount_minor": { "type": "null" }
+        }
+      },
+      "then": {
+        "properties": {
+          "refunded_amount_semantics": { "type": "null" },
+          "refund_scope": { "const": "UNKNOWN" }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "refundFieldsNull": {
+      "description": "The three refund fields are present and null on every non-refund event.",
+      "properties": {
+        "refunded_amount_minor": { "type": "null" },
+        "refunded_amount_semantics": { "type": "null" },
+        "refund_scope": { "type": "null" }
+      }
+    },
+    "utcInstant": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,9})?Z$",
+      "description": "Instant in UTC with a trailing Z. An offset form is rejected on purpose: this field is an instant, and the provider's local offset belongs to the adapter, not to the canonical event. format is an annotation in 2020-12, so the pattern is what actually constrains it."
+    }
+  }
+}
