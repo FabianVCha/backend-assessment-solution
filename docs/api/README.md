@@ -35,7 +35,9 @@ Contracts only. No code ships from this directory.
   `204` within 5 s. No path returns `202`: a `2xx` here means the inbox row and both outbox jobs
   committed, not that work was queued for later judgement.
 - **Duplicates.** Quetzal retries the same `id`. Andina sends a **new `notificacion_id` on every
-  attempt**, so its identity is `transaccion.id` + `estado` + `fecha_transaccion` and nothing else.
+  attempt**, so its identity is `transaccion.id` + `estado` and nothing else: the provider states
+  that this pair identifies the business event and does not change between attempts, while
+  `fecha_transaccion` is never promised to be stable.
   Deduplication is the unique insert on `(provider, event_id)`; a duplicate is acknowledged with no
   outbox job and no republication.
 

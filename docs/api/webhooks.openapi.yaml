@@ -49,7 +49,8 @@ paths:
       description: |
         Only 200 or 204 is success, anything else is a failure, provider timeout 5 s.
         Every retry is a new notification with a new notificacion_id, so the business event is
-        transaccion.id + estado + fecha_transaccion and event_id is derived from that triple.
+        transaccion.id + estado, the pair the provider keeps stable across attempts, and event_id is
+        derived from that pair.
         200 with a receipt on first acceptance, 204 with no body on a duplicate.
       parameters:
         - $ref: '#/components/parameters/AndinaTimestamp'

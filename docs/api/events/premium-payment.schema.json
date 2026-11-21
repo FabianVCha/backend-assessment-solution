@@ -35,7 +35,7 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 128,
-      "description": "The provider's own event identifier when it is stable across retries: Quetzal sends it in `id`. Andina sends a new `notificacion_id` on every attempt, so its event id is the SHA-256 of `transaccion.id | transaccion.estado | transaccion.fecha_transaccion` (design section 4.1). Unique only within one provider, so the event identity is the pair (provider, event_id)."
+      "description": "The provider's own event identifier when it is stable across retries: Quetzal sends it in `id`. Andina sends a new `notificacion_id` on every attempt, so its event id is the SHA-256 of `transaccion.id | transaccion.estado`, the pair the provider states identifies the business event and does not change between attempts (design section 4.1). Unique only within one provider, so the event identity is the pair (provider, event_id)."
     },
     "provider": {
       "type": "string",
