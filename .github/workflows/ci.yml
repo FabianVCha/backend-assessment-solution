@@ -39,8 +39,7 @@ jobs:
           distribution: temurin
           java-version: '21'
           cache: maven
-      # The suite is the only proof that FR1, FR2, FR4 and NFR3 still hold, and it validates every
-      # produced event against the published schema, so a contract drift fails here.
+      # Local behavioral, durability and schema regression coverage; not evidence of cloud SLOs.
       - run: mvn -B -ntp -f practical/pom.xml test
         env:
           INTAKE_IT_JDBC_URL: jdbc:postgresql://127.0.0.1:5432/intake
@@ -71,15 +70,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: azure/cli@v2
-        with:
-          # No login: bicep build is a compiler, not an ARM call. That is why this gate runs on a
-          # pull request from a fork without any credential.
-          inlineScript: |
-            az bicep build --file infra/main.bicep --stdout > /dev/null
-            for environment in dev test prod; do
-              az bicep build-params --file "infra/params/$environment.bicepparam" --stdout > /dev/null
-            done
+      # No login: Bicep compilation is offline and requires no subscription.
+      - run: az bicep install --version v0.49.2
+      - run: |
+          az bicep build --file infra/main.bicep --stdout > /dev/null
+          for environment in dev test prod; do
+            az bicep build-params --file "infra/params/$environment.bicepparam" --stdout > /dev/null
+          done
 
   security:
     name: secrets and image
@@ -90,10 +87,13 @@ jobs:
           fetch-depth: 0
       # The repository is public: a leaked credential cannot be un-leaked by a later commit, so the
       # scan runs on the whole history, not only on the diff.
-      - uses: gitleaks/gitleaks-action@v2.3.9
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: build the image the pipeline would deploy
+      - name: scan checked-out Git history for secrets
+        run: |
+          curl --fail --silent --show-error --location -o gitleaks.tgz \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.0/gitleaks_8.30.0_linux_x64.tar.gz
+          tar xzf gitleaks.tgz gitleaks
+          ./gitleaks git --redact --config .github/workflows/gitleaks.toml --log-opts=--all .
+      - name: build the local assessment demo image
         run: docker build -t premium-payment-intake:ci practical
       - uses: aquasecurity/trivy-action@v0.36.0
         with:
@@ -111,9 +111,11 @@ jobs:
       # Pinned release, no third-party action: a linter that runs from a moving tag is not a gate.
       - name: install actionlint
         run: |
-          curl -sSL -o actionlint.tgz \
+          curl --fail --silent --show-error --location -o actionlint.tgz \
             https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
           tar xzf actionlint.tgz actionlint
           ./actionlint --version
-      - name: lint
-        run: ./actionlint -color
+      - name: lint workflows and deployment script
+        run: |
+          ./actionlint -color
+          shellcheck .github/workflows/deploy-stage.sh

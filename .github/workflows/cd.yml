@@ -1,121 +1,39 @@
 name: cd
 
-# Defined, not executed: this workflow has never run against an Azure subscription. It exists so the
-# delivery path is reviewable, and it authenticates with OIDC so there is no secret to store.
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
+    inputs:
+      release_digest:
+        description: 'Approved production-runtime manifest digest (sha256:...) already in each stage ACR'
+        required: true
+        type: string
 
 permissions:
-  id-token: write # federated credential to Azure; no client secret anywhere
   contents: read
+  id-token: write
 
 concurrency:
   group: cd-main
   cancel-in-progress: false
 
-env:
-  AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
-  AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
-  AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
-
 jobs:
-  image:
-    name: build and push the image
-    runs-on: ubuntu-latest
-    # No environment here: the build must not inherit a stage's approvals or its variables.
-    outputs:
-      digest: ${{ steps.push.outputs.digest }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: azure/login@v2
-        with:
-          client-id: ${{ env.AZURE_CLIENT_ID }}
-          tenant-id: ${{ env.AZURE_TENANT_ID }}
-          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
-      # The digest is what gets promoted. A tag can be moved between review and deploy; a digest cannot.
-      - id: push
-        run: |
-          image="${{ vars.ACR_LOGIN_SERVER }}/premium-payment-intake:${GITHUB_SHA::12}"
-          az acr login --name "${{ vars.ACR_NAME }}"
-          docker build -t "$image" practical
-          docker push "$image"
-          echo "digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$image")" >> "$GITHUB_OUTPUT"
-          cat "$GITHUB_OUTPUT"
+  dev:
+    if: github.ref == 'refs/heads/main' && vars.PRODUCTION_RUNTIME_CD_ENABLED == 'true'
+    uses: ./.github/workflows/cd-stage.yml
+    with:
+      stage: dev
+      release_digest: ${{ inputs.release_digest }}
 
-  deploy-dev:
-    name: deploy dev
-    needs: image
-    runs-on: ubuntu-latest
-    environment:
-      name: dev
-      url: ${{ steps.deploy.outputs.app_url }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: azure/login@v2
-        with:
-          client-id: ${{ env.AZURE_CLIENT_ID }}
-          tenant-id: ${{ env.AZURE_TENANT_ID }}
-          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
-      # Infrastructure first, then the image: the deployment is idempotent and the parameter file is
-      # the environment's contract.
-      - id: deploy
-        run: |
-          az deployment group create \
-            --resource-group "${{ vars.RESOURCE_GROUP }}" \
-            --template-file infra/main.bicep \
-            --parameters infra/params/dev.bicepparam \
-            --parameters containerImage="${{ needs.image.outputs.digest }}"
-          echo "app_url=$(az deployment group show --resource-group "${{ vars.RESOURCE_GROUP }}" --name main --query properties.outputs.intakeAppName.value -o tsv)" >> "$GITHUB_OUTPUT"
+  test:
+    needs: dev
+    uses: ./.github/workflows/cd-stage.yml
+    with:
+      stage: test
+      release_digest: ${{ inputs.release_digest }}
 
-  deploy-test:
-    name: deploy test
-    # image is listed so its digest is visible here: a job reads the outputs of its own needs only.
-    needs: [image, deploy-dev]
-    runs-on: ubuntu-latest
-    # GitHub Environment with a required reviewer: the stage cannot start without a human.
-    environment: test
-    steps:
-      - uses: actions/checkout@v4
-      - uses: azure/login@v2
-        with:
-          client-id: ${{ env.AZURE_CLIENT_ID }}
-          tenant-id: ${{ env.AZURE_TENANT_ID }}
-          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
-      - run: |
-          az deployment group create \
-            --resource-group "${{ vars.RESOURCE_GROUP }}" \
-            --template-file infra/main.bicep \
-            --parameters infra/params/test.bicepparam \
-            --parameters containerImage="${{ needs.image.outputs.digest }}"
-
-  deploy-prod:
-    name: deploy prod
-    needs: [image, deploy-test]
-    runs-on: ubuntu-latest
-    # Second approval, separate from test: nobody promotes to production with the same click.
-    environment: prod
-    steps:
-      - uses: actions/checkout@v4
-      - uses: azure/login@v2
-        with:
-          client-id: ${{ env.AZURE_CLIENT_ID }}
-          tenant-id: ${{ env.AZURE_TENANT_ID }}
-          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
-      # what-if is the last review before the change lands, and it runs with the same parameters the
-      # apply uses.
-      - name: preview
-        run: |
-          az deployment group what-if \
-            --resource-group "${{ vars.RESOURCE_GROUP }}" \
-            --template-file infra/main.bicep \
-            --parameters infra/params/prod.bicepparam \
-            --parameters containerImage="${{ needs.image.outputs.digest }}"
-      - name: apply
-        run: |
-          az deployment group create \
-            --resource-group "${{ vars.RESOURCE_GROUP }}" \
-            --template-file infra/main.bicep \
-            --parameters infra/params/prod.bicepparam \
-            --parameters containerImage="${{ needs.image.outputs.digest }}"
+  prod:
+    needs: test
+    uses: ./.github/workflows/cd-stage.yml
+    with:
+      stage: prod
+      release_digest: ${{ inputs.release_digest }}
