@@ -22,21 +22,37 @@ param location string = resourceGroup().location
 @description('Prefix for every resource name.')
 param namePrefix string = 'meridian-payments'
 
-@description('PostgreSQL size. B1MS is what ADR-0002 prices; test and prod may raise it without touching code.')
+@description('PostgreSQL compute size; B1MS is a load-test starting point.')
 param postgresSkuName string = 'Standard_B1ms'
 
-@description('PostgreSQL storage in GB. 40 GB covers the 13-month hot window (design §6.4).')
-param postgresStorageSizeGb int = 40
+@allowed([
+  'Burstable'
+  'GeneralPurpose'
+  'MemoryOptimized'
+])
+param postgresSkuTier string = 'Burstable'
+
+@description('PostgreSQL initial storage in GB, at a supported disk tier. Re-size after measuring actual row sizes and I/O.')
+param postgresStorageSizeGb int = 64
+
+@description('Object ID of a separate Entra database administrator group used to bootstrap application roles.')
+param postgresAdminGroupObjectId string
+
+@description('Display name of the Entra database administrator group.')
+param postgresAdminGroupName string
 
 @description('PostgreSQL backup retention in days.')
 param postgresBackupRetentionDays int = 7
 
-@description('Service Bus tier. Standard is what ADR-0002 decides; Premium is a cost review away.')
+@description('Service Bus Premium messaging units. Premium is required for the private endpoint.')
 @allowed([
-  'Standard'
-  'Premium'
+  1
+  2
+  4
+  8
+  16
 ])
-param serviceBusSku string = 'Standard'
+param serviceBusMessagingUnits int = 1
 
 @description('Consumer subscriptions created on the canonical-event topic.')
 param consumerSubscriptions array = [
@@ -65,11 +81,11 @@ param keyVaultPurgeProtection bool = false
 @description('Key Vault soft-delete retention in days.')
 param keyVaultSoftDeleteRetentionInDays int = 7
 
-@description('Private endpoints for PostgreSQL, Service Bus and Key Vault. Test and prod yes; dev can skip them and save the cost.')
-param enablePrivateEndpoints bool = true
+@description('Deploy the intake app only after registering an approved runtime image and completing stage prerequisites.')
+param deployApplication bool = false
 
-@description('Container image the pipeline deploys. The placeholder is replaced by the CD workflow.')
-param containerImage string
+@description('Fully qualified release image reference pinned by manifest digest; blank for foundation-only deployment.')
+param containerImage string = ''
 
 @description('Replica bounds.')
 param minReplicas int = 1
@@ -110,16 +126,8 @@ resource registry 'Microsoft.ContainerRegistry/registries@2023-07-01' = {
   }
   properties: {
     adminUserEnabled: false
-    // A private endpoint for ACR is not created: the image is pulled during deployment, and the
-    // pipeline runs from GitHub, not from inside the VNet. This is the one public surface left and it
-    // is stated in docs/infra/AZURE_SERVICES.md.
+    // Registry admission is enforced by Entra RBAC. Basic does not support Private Link.
     publicNetworkAccess: 'Enabled'
-    policies: {
-      retentionPolicy: {
-        status: 'enabled'
-        days: 30
-      }
-    }
   }
 }
 
@@ -156,8 +164,8 @@ module keyVault 'modules/keyvault.bicep' = {
     location: location
     softDeleteRetentionInDays: keyVaultSoftDeleteRetentionInDays
     purgeProtectionEnabled: keyVaultPurgeProtection
-    privateEndpointSubnetId: enablePrivateEndpoints ? network.outputs.privateEndpointsSubnetId : ''
-    privateDnsZoneId: enablePrivateEndpoints ? network.outputs.vaultDnsZoneId : ''
+    privateEndpointSubnetId: network.outputs.privateEndpointsSubnetId
+    privateDnsZoneId: network.outputs.vaultDnsZoneId
     tags: resourceTags
   }
 }
@@ -168,7 +176,9 @@ module messaging 'modules/messaging.bicep' = {
     namePrefix: namePrefix
     environment: environment
     location: location
-    skuName: serviceBusSku
+    messagingUnits: serviceBusMessagingUnits
+    privateEndpointSubnetId: network.outputs.privateEndpointsSubnetId
+    privateDnsZoneId: network.outputs.serviceBusDnsZoneId
     subscriptionNames: consumerSubscriptions
     maxDeliveryCount: serviceBusMaxDeliveryCount
     lockDuration: serviceBusLockDuration
@@ -184,12 +194,13 @@ module data 'modules/data.bicep' = {
     environment: environment
     location: location
     skuName: postgresSkuName
+    skuTier: postgresSkuTier
     storageSizeGb: postgresStorageSizeGb
     backupRetentionDays: postgresBackupRetentionDays
-    administratorObjectId: identity.properties.principalId
-    administratorLogin: identity.name
-    privateEndpointSubnetId: enablePrivateEndpoints ? network.outputs.privateEndpointsSubnetId : ''
-    privateDnsZoneId: enablePrivateEndpoints ? network.outputs.postgresDnsZoneId : ''
+    administratorObjectId: postgresAdminGroupObjectId
+    administratorLogin: postgresAdminGroupName
+    privateEndpointSubnetId: network.outputs.privateEndpointsSubnetId
+    privateDnsZoneId: network.outputs.postgresDnsZoneId
     tags: resourceTags
   }
 }
@@ -198,7 +209,8 @@ module roles 'modules/roles.bicep' = {
   name: 'roles'
   params: {
     principalId: identity.properties.principalId
-    serviceBusTopicId: messaging.outputs.topicId
+    serviceBusNamespaceName: messaging.outputs.namespaceName
+    serviceBusTopicName: messaging.outputs.topicName
     keyVaultId: keyVault.outputs.id
     containerRegistryId: registry.id
     applicationInsightsId: observability.outputs.applicationInsightsId
@@ -212,10 +224,13 @@ module compute 'modules/compute.bicep' = {
     environment: environment
     location: location
     image: containerImage
+    deployApplication: deployApplication
+    vnetId: network.outputs.vnetId
     containerAppsSubnetId: network.outputs.containerAppsSubnetId
     logAnalyticsCustomerId: observability.outputs.workspaceCustomerId
     logAnalyticsSharedKey: observability.outputs.workspaceSharedKey
     identityId: identity.id
+    identityClientId: identity.properties.clientId
     registryLoginServer: registry.properties.loginServer
     serviceBusNamespace: messaging.outputs.fullyQualifiedNamespace
     serviceBusTopic: messaging.outputs.topicName
@@ -236,6 +251,9 @@ module compute 'modules/compute.bicep' = {
 
 output intakeAppName string = compute.outputs.appName
 output intakeAppId string = compute.outputs.appId
+output intakePrivateFqdn string = compute.outputs.appFqdn
+output intakePrivateIp string = compute.outputs.environmentPrivateIp
+output intakeDnsZone string = compute.outputs.environmentDnsZone
 output registryLoginServer string = registry.properties.loginServer
 output registryName string = registry.name
 output identityClientId string = identity.properties.clientId
