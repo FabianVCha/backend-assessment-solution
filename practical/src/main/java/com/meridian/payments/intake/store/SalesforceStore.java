@@ -1,8 +1,8 @@
 package com.meridian.payments.intake.store;
 
 import java.time.Instant;
-import java.time.LocalDate;
 import java.util.Optional;
+import java.util.UUID;
 
 /**
  * The Salesforce lane's own view of the outbox: claim a payment fact, decide, record what happened.
@@ -14,7 +14,8 @@ import java.util.Optional;
 public interface SalesforceStore {
 
     /** What the projection knows about a payment, for the ordering decision. */
-    record PaymentProjection(String latestStatus, Instant latestStatusChangedAt, String remoteAppliedStatus) {
+    record PaymentProjection(String latestStatus, Instant latestStatusChangedAt, String remoteAppliedStatus,
+                             String latestEventId) {
     }
 
     /** Claims due Salesforce jobs, skipping any payment that already has a write in flight. */
@@ -38,11 +39,14 @@ public interface SalesforceStore {
     /** Retryable: back to pending with the next attempt scheduled. */
     void failed(PendingJob job, String code);
 
-    /** Reserves a call and one in-flight slot, returning the UTC bucket to release after the call. */
-    Optional<LocalDate> tryAcquireBudget();
+    /** Checks whether this worker still owns the right to dispatch the job. */
+    boolean canDispatch(PendingJob job);
+
+    /** Reserves a call and one expiring in-flight slot. */
+    Optional<UUID> tryAcquireBudget();
 
     /** Releases concurrency capacity only; the attempted call still counts in the rolling window. */
-    void releaseBudget(LocalDate day);
+    void releaseBudget(UUID token);
 
     /** Defers a claimed job without counting an attempt: no write was made. */
     void deferForBudget(PendingJob job);
