@@ -7,7 +7,7 @@
 
 | Field | Value |
 |---|---|
-| Candidate ID (provided by your recruiter) | Candidate to complete |
+| Candidate ID (provided by your recruiter) | fabian.vasquez.a0952@gmail.com |
 | Final commit SHA | Candidate to complete after reviewing and committing the files |
 | Date and time of submission (with time zone) | Candidate to complete |
 
