@@ -111,6 +111,7 @@ practical/
     V4__salesforce_lane.sql          DEAD and HELD, the outcome code and the in-flight index
     V5__salesforce_budget.sql        UTC counters and admission times for the rolling window
     V6__replay.sql                   replay submissions, their justifications and outcomes
+    V9__salesforce_safety.sql        stable status precedence and expiring budget reservations
   src/test/java/com/meridian/payments/intake/
     TestSamples.java                 published samples and the schema path
     MutableClock.java                a clock the tests move by hand
@@ -242,7 +243,7 @@ Measured with the built image against PostgreSQL 16: a signed event was accepted
 container was killed with `SIGKILL` one second later, and the database held one event, two jobs and one
 projection row with zero published. A fresh container on the same database, with no other replica
 running, published the pending canonical event on its first tick and logged it. The Salesforce job stayed
-pending, because no relay owns it yet.
+pending in that earlier run, before the Salesforce simulator was added.
 
 What that does not prove: a database or region failure. That needs the backup and restore drill, and it
 is not claimed here.
@@ -319,14 +320,15 @@ has no code for an unsupported media type, so inventing one would break the cont
 `SalesforceRelay` drains the `SALESFORCE` destination the canonical publisher deliberately leaves alone, so
 a broker outage and a Salesforce outage stay separate failures.
 
-- **Ordering comes from the provider's clock, not from arrival.** Before writing, the relay reads the
-  payment projection. An event whose `status_changed_at` is older than the payment's newest fact is skipped
-  and marked `STALE_SKIPPED`: a delayed capture cannot replace a reversal that already landed.
-- **One writer per payment.** The claim excludes any payment that already has a write in flight, so two
-  replicas do not push two facts for one payment at the same moment; within a batch the writes are serial.
-  The residual window — two claims starting in the same instant — is real and stated rather than papered
-  over: only the destination can close it completely, and that needs an agreement with Salesforce.
-- **Every answer is classified, never thrown:**
+- **Ordering is deterministic.** Provider timestamp wins first; equal timestamps use `REFUNDED`,
+  `CAPTURED`, `FAILED`, then `PENDING`, followed by a stable event ID tie-break. An event that is not
+  the projection winner is marked `STALE_SKIPPED`. Treat precedence as an explicit business assumption
+  to validate with the providers, not as a guarantee of their event sequence.
+- **One active claim per payment.** A short PostgreSQL transaction lock serializes selection across
+  replicas, at most one row per payment per claim batch. The lock is released before any client call.
+  Completion and the applied projection commit together. An expired Salesforce claim is held, not
+  reclaimed for blind retry; another payment can still advance. This does not fence a remote write.
+- **Classified responses follow different recovery rules:**
 
 | Salesforce answer | What it means | What the relay does |
 |---|---|---|
@@ -337,11 +339,13 @@ a broker outage and a Salesforce outage stay separate failures.
 | `INVALID_SESSION_ID` | session expired | one refresh inside the client, then retry |
 | `403 REQUEST_LIMIT_EXCEEDED` | daily budget gone | the lane stops and the rest go back to pending |
 | `5xx` | remote failure | bounded retry |
-| timeout | outcome unknown | bounded retry, `TIMEOUT` |
+| timeout | outcome unknown | `HELD` / `TIMEOUT`; later writes for the payment wait |
 | applied but response lost | outcome unknown and possibly landed | `HELD` / `LOST_RESPONSE`, never retried |
 
-`HELD` exists for the last row and for nothing else. Retrying it would duplicate a fact; marking it done
-would claim a success nobody observed. It is the one state the relay refuses to resolve by itself.
+An expired claim or unclassified client exception also goes to `HELD`. The ordinary replay command
+cannot clear it. This repository has no authoritative remote reconciliation yet; do not use this
+profile against a real Salesforce organization. A real adapter needs bounded request deadlines
+and must classify any response that might have applied the write as ambiguous.
 
 Before each client write, PostgreSQL reserves one of 150,000 calls per rolling 24 hours and one of
 25 concurrent requests across replicas sharing the database. The UTC-day counter and the unexpired
@@ -349,7 +353,9 @@ admissions from the previous day are counted together: midnight does not reset t
 The client call runs outside the reservation transaction. When admission is denied, that job and
 the rest of the claimed batch go back to `PENDING` with `BUDGET_EXHAUSTED` and a three-minute delay.
 No attempt is charged to those jobs. A returned or thrown client failure releases the in-flight
-slot but still counts as a call. A remote `403` retains its existing `RATE_LIMITED` handling.
+slot by token but still counts as a call. An abandoned slot expires after 30 seconds; expiry is
+not evidence about the payment write. This duration requires a shorter bounded client deadline
+before production use. A remote `403` still stops only the current batch.
 
 The client is `SimulatedSalesforce`: the fault matrix is scripted per test and no real Salesforce call is
 made anywhere in this repository. The port is the seam where a real client goes.
@@ -373,10 +379,10 @@ changing the audit or the queue. Use a new key only for a new operator decision.
 
 `replay_command` records the requested target, requester, reason, time, key and queue outcome.
 `REQUEUED` means the existing job is due again (`PENDING` / `REPLAY`, zero attempts), not that the
-destination applied it. Replay refuses a `CLAIMED` job, including one whose lease expired; the
-worker's normal claim path handles expiry. The immutable event and its other destination do not
-change. The Salesforce relay still skips an older event as `STALE_SKIPPED`. A replay of a `HELD`
-job is an explicit operator choice: reconcile the ambiguous write before requesting it.
+destination applied it. Ordinary replay accepts a `DEAD` job or a previously failed pending job
+except one deferred by Salesforce rate limiting. It refuses `CLAIMED`, `HELD`, already finished,
+and unattempted jobs. A `HELD` job returns `RECONCILIATION_REQUIRED`; there is no override here.
+The immutable event and its other destination do not change. The relay still skips stale events.
 
 ## INC-0412: query and recovery
 
@@ -408,6 +414,9 @@ would use the organization's OIDC provider through the `OpsIdentity` port; that 
 TLS and operating controls are not implemented or validated. The broker and Salesforce remain
 simulated.
 
+The optional [local demonstration](../LOCAL_DEMO.md) enables this profile and runs the terminal
+console against the same API.
+
 ## Running it
 
 Two profiles. The durable one needs nothing but Docker:
@@ -431,12 +440,15 @@ The sandbox vectors and the signature scheme are in `../reference/providers/*/WE
 The in-memory profile exists for the demo and has to be asked for by name:
 
 ```sh
-docker run --rm -p 8080:8080 \
+docker run --rm -p 127.0.0.1:8080:8080 \
   -e INTAKE_ALLOW_IN_MEMORY_STORE=true \
-  -e QUETZAL_WEBHOOK_SECRET=<sandbox vector> \
-  -e ANDINA_WEBHOOK_SECRET=<sandbox vector> \
+  -e QUETZAL_WEBHOOK_SECRET \
+  -e ANDINA_WEBHOOK_SECRET \
+  -e AUSTRAL_WEBHOOK_SECRET \
   premium-payment-intake:local
 ```
+
+Set each variable to its corresponding fictional sandbox vector before running the command.
 
 Without `INTAKE_JDBC_URL` and without that flag the process refuses to start. A deployment that forgot
 the database must fail loudly, not accept payments into a store that loses them on restart.
@@ -446,12 +458,14 @@ store is no longer one of them.
 
 ## Tests and evidence
 
-208 JUnit 5 tests: 158 need nothing but a JVM, and 50 more run against a real PostgreSQL when
-`INTAKE_IT_JDBC_URL` is set (CI sets it, so they are a gate and not a local habit).
+215 JUnit 5 tests passed with Java 21 and PostgreSQL 16: 158 do not require the database and
+57 exercise PostgreSQL when `INTAKE_IT_JDBC_URL` is set. CI supplies this variable. The test
+database is destructive disposable state: never point the suite at a shared environment.
 
-Authentication (51):
+Authentication:
 
-- the seven official vectors (3 Quetzal, 4 Andina) verify byte for byte;
+- the seven MX/CO official vectors (3 Quetzal, 4 Andina) verify byte for byte; dedicated
+  Austral tests cover Chile's raw-body HMAC and error handling;
 - altered body and parsed/re-serialised JSON are rejected;
 - missing, blank, malformed and garbage headers are rejected with the contract failure codes;
 - rotation with two `v1` values, any match wins;
@@ -460,10 +474,10 @@ Authentication (51):
 - a logging capture proves no secret, signature, body or payer value is logged;
 - a source scan proves no sandbox secret material exists under `src/main`.
 
-Canonical mapping (43):
+Canonical mapping:
 
-- every one of the seven samples produces an event that the published JSON Schema accepts;
-- both providers are asserted field by field, including the UTC conversion and the cents conversion;
+- samples for all three providers produce events that the published JSON Schema accepts;
+- provider mappers are asserted field by field, including UTC, minor units and CLP's zero exponent;
 - a retry maps to the same `event_id`, and a different state of the same transaction does not;
 - refund branches: full, partial, above the charge amount, and a refund with no reported amount;
 - failures: malformed JSON, non-object JSON, a missing event id, an unknown charge type, an unknown
@@ -491,34 +505,39 @@ PostgreSQL store (17, skipped without a database):
 - the projection keeps the newest status by the provider clock, a late capture does not replace a newer
   reversal, a duplicate is counted once, and a rolled-back accept leaves no projection row.
 
-Salesforce lane (15, against a database and a scripted destination):
+Salesforce lane (20, against a database and a scripted destination):
 
 - an applied write marks the job `APPLIED` and records the applied status on the projection;
 - an invalid field is `DEAD` and is never sent again;
 - a locked row is rescheduled with the same 1 s → 60 s curve;
 - a rate limit stops the lane and puts the rest back to pending;
 - a lost response is `HELD`, the projection claims nothing, and it is never retried;
-- a timeout is retried instead of being called ambiguous;
+- a timeout holds the payment while unrelated payments continue;
 - an older event is skipped and the newer one applied, with one write to the destination;
 - a payment with a write in flight is not claimed by another worker;
 - a completion with a stale token changes nothing;
 - capacity is reserved before a write and released after it or a client exception; the rolling
   limit defers the whole batch, and in-flight work still counts after UTC midnight;
-- two replicas racing for the last call or in-flight slot admit exactly one write.
+- two replicas racing for the last call or in-flight slot admit exactly one write;
+- two claimers cannot take different jobs for one payment, and a same-time refund wins in either
+  arrival order;
+- an expired claim cannot complete and holds its payment; an injected projection failure rolls
+  back completion; expired budget reservations free capacity without erasing recent admissions.
 
-Replay (9, against PostgreSQL):
+Replay (10, against PostgreSQL):
 
 - a dead job is made due again without creating an event or disturbing the other destination;
 - a missing reason is rejected and the first outcome for a key is retained;
 - a claimed job is not reset, even if the lease expired;
 - a replayed older event is skipped without a remote write or a change to the applied status;
 - the CLI rejects unknown destinations, unknown events, and reuse of a key for another target;
-- concurrent duplicate requests reset once, and an audit failure rolls back the whole command.
+- concurrent duplicate requests reset once, and an audit failure rolls back the whole command;
+- ordinary replay rejects unattempted, previously applied and held writes.
 
-Operations API (8, against PostgreSQL over a real socket): token rejection and role checks, country
+Operations API (9, against PostgreSQL over a real socket): token rejection and role checks, country
 isolation, cursor bounds, empty versus unavailable overview, dead and retry timelines, worker
 milestones, and country-scoped replay with a committed audit row. Rejected replay of a claimed
-job leaves both the outbox and audit unchanged.
+job leaves both the outbox and audit unchanged; held and unattempted replay requests are also rejected.
 
 Store and intake (16):
 
@@ -545,7 +564,7 @@ Publisher (9):
 - the batch size is respected;
 - the loop publishes with nobody calling the publisher, and a broker failure does not stop it.
 
-HTTP surface (8):
+HTTP surface (11):
 
 - an accepted notification is a `200` with the receipt; a Quetzal duplicate is a `200` `DUPLICATE`;
   an Andina duplicate is a `204` with no body;
@@ -594,9 +613,10 @@ no red-phase capture; their evidence is the full suite green plus the injected f
 - No relay against a real Salesforce: the client is a simulator with a scripted fault matrix. The port is
   the seam, and the real client needs the sandbox contract and its session handling.
 - The guard counts calls at the client boundary. A real client would need to account for any
-  internal refreshes or retries and for other consumers of the same Salesforce quota. A process
-  killed during a call can leave an in-flight reservation; there is no automatic reclamation.
-  Admission history has no retention job yet.
+  internal refreshes or retries and for other consumers of the same Salesforce quota. Expired
+  in-flight reservations are reclaimed on the next admission, which also prunes old call history.
+  The 30-second reservation horizon requires a shorter, enforced adapter deadline; expiry does
+  not authorize a retry of an ambiguous payment.
 - The legacy JDBC replay CLI accepts a caller-supplied requester and must be protected externally.
   The local HTTP replay endpoint derives its requester and scope from its token. Both audit the queue
   reset, not the eventual delivery outcome.
