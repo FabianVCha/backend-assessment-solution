@@ -12,6 +12,9 @@ import com.meridian.payments.intake.canonical.CanonicalEventMapper;
 import com.meridian.payments.intake.canonical.QuetzalCanonicalEventMapper;
 import com.meridian.payments.intake.http.IntakeServer;
 import com.meridian.payments.intake.http.WebhookEndpoint;
+import com.meridian.payments.intake.ops.LocalOpsIdentity;
+import com.meridian.payments.intake.ops.OperationsRouter;
+import com.meridian.payments.intake.ops.OperationsStore;
 import com.meridian.payments.intake.publish.Broker;
 import com.meridian.payments.intake.publish.CanonicalEventPublisher;
 import com.meridian.payments.intake.publish.PublisherLoop;
@@ -61,6 +64,10 @@ public final class IntakeApplication {
 
         Clock clock = Clock.systemUTC();
         String jdbcUrl = environment("INTAKE_JDBC_URL", "");
+        var opsIdentity = LocalOpsIdentity.fromEnvironment(System.getenv(), clock);
+        if (opsIdentity.isPresent() && jdbcUrl.isBlank()) {
+            throw new IllegalStateException("The local operations profile requires PostgreSQL");
+        }
         Database database = null;
         IntakeStore intakeStore;
         OutboxStore outboxStore;
@@ -109,9 +116,11 @@ public final class IntakeApplication {
                         new SimulatedSalesforce(),
                         25),
                 Duration.ofSeconds(10));
+        var operations = opsIdentity.isEmpty() ? null
+                : new OperationsRouter(opsIdentity.get(), new OperationsStore(database));
         try (PublisherLoop loop = new PublisherLoop(publisher, Duration.ofSeconds(10));
              SalesforceRelayLoop relayLoop = relay;
-             IntakeServer server = IntakeServer.start(new WebhookEndpoint(intake), port)) {
+             IntakeServer server = IntakeServer.start(new WebhookEndpoint(intake), port, operations)) {
             loop.start();
             if (relayLoop != null) {
                 relayLoop.start();

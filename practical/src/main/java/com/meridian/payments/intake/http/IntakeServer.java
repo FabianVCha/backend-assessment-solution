@@ -1,5 +1,6 @@
 package com.meridian.payments.intake.http;
 
+import com.meridian.payments.intake.ops.OperationsRouter;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 
@@ -36,11 +37,19 @@ public final class IntakeServer implements AutoCloseable {
     }
 
     public static IntakeServer start(WebhookEndpoint endpoint, int port) throws IOException {
+        return start(endpoint, port, null);
+    }
+
+    public static IntakeServer start(WebhookEndpoint endpoint, int port, OperationsRouter operations)
+            throws IOException {
         Objects.requireNonNull(endpoint, "endpoint");
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
         ExecutorService executor = Executors.newFixedThreadPool(4);
         server.setExecutor(executor);
         server.createContext("/", exchange -> handle(exchange, endpoint));
+        if (operations != null) {
+            server.createContext(OperationsRouter.ROOT + "/", operations);
+        }
         server.start();
         return new IntakeServer(server, executor);
     }

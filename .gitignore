@@ -21,6 +21,9 @@ build/
 .vscode/
 *.iml
 .DS_Store
+# Local agent tooling
+/.atl/
+/odd/tasks/
 # Local secrets
 .env
 *.env

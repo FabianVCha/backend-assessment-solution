@@ -6,6 +6,7 @@ Contracts only. No code ships from this directory.
 |---|---|
 | `webhooks.openapi.yaml` | OpenAPI 3.1 intake contract: Quetzal Pagos (MX), Andina Pay (CO) and Austral Pagos (CL) |
 | `events/premium-payment.schema.json` | JSON Schema 2020-12 of the canonical event |
+| [`operations-v1.md`](operations-v1.md) | Local operator API: scoped reads, overview, and audited replay |
 
 `webhooks.openapi.yaml` is at **1.1.0**. The canonical event stays at `schema_version 1.0`: the schema
 already declared `CL`, `CLP` and `AUSTRAL` because the design covered three countries, so Chile needed

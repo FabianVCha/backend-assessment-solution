@@ -19,7 +19,8 @@ the guarantee was not: a restart lost every accepted event, and two replicas had
 1. **PostgreSQL is the operational system of record** for receipt and processing. The inbox row and both
    outbox jobs are written in one transaction, and the unique constraint on `(provider, event_id)`
    decides duplicates. Acceptance inserts with `ON CONFLICT DO NOTHING`; a zero row count means another
-   delivery committed first. No code path reads before it writes.
+   delivery committed first. No code path reads before it writes. G3a counts the duplicate delivery
+   against that accepted row without changing its canonical fact, jobs or projection.
 2. **Migrations run before the first query.** Flyway applies `db/migration` and records what it applied;
    a process that cannot migrate refuses to start.
 3. **Publication is claimed, not read.** A worker takes a bounded batch under a 30-second lease with
