@@ -162,8 +162,10 @@ class ReplayServiceIT extends ReplayPostgresFixture {
         accept("new", "PAY-1", "POL-CO-000000001", "REFUNDED", Instant.EPOCH.plusSeconds(1));
         SimulatedSalesforce client = new SimulatedSalesforce();
         var relay = relay(client);
+        assertEquals(0, relay.drain()); // One claimed job per payment; the obsolete job is skipped.
         assertEquals(1, relay.drain());
 
+        execute("UPDATE outbox_job SET state = 'DEAD' WHERE outcome_code = 'STALE_SKIPPED'");
         assertEquals("REQUEUED", replay("old", "Confirm ordering", "r-1").name());
         assertEquals("PENDING/REPLAY/0", job("old", Destination.SALESFORCE));
         assertEquals(0, relay.drain());
