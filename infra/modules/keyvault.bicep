@@ -17,10 +17,10 @@ param softDeleteRetentionInDays int
 @description('Purge protection is on in prod only: it makes a mistaken vault deletion irreversible for the retention window.')
 param purgeProtectionEnabled bool
 
-@description('Private endpoint subnet, or empty to keep the default public endpoint with firewall rules.')
+@description('Private endpoint subnet.')
 param privateEndpointSubnetId string
 
-@description('Private DNS zone for privatelink.vaultcore.azure.net, or empty to skip the endpoint.')
+@description('Private DNS zone for privatelink.vaultcore.azure.net.')
 param privateDnsZoneId string
 
 param tags object
@@ -39,17 +39,15 @@ resource vault 'Microsoft.KeyVault/vaults@2023-07-01' = {
     enableSoftDelete: true
     softDeleteRetentionInDays: softDeleteRetentionInDays
     enablePurgeProtection: purgeProtectionEnabled
-    publicNetworkAccess: empty(privateEndpointSubnetId) ? 'Enabled' : 'Disabled'
+    publicNetworkAccess: 'Disabled'
     networkAcls: {
-      defaultAction: empty(privateEndpointSubnetId) ? 'Allow' : 'Deny'
-      bypass: 'AzureServices'
+      defaultAction: 'Deny'
+      bypass: 'None'
     }
   }
 }
 
-// Only created when the network module hands over a subnet and a zone: dev can run without a private
-// endpoint, prod cannot.
-resource endpoint 'Microsoft.Network/privateEndpoints@2023-09-01' = if (!empty(privateEndpointSubnetId) && !empty(privateDnsZoneId)) {
+resource endpoint 'Microsoft.Network/privateEndpoints@2023-09-01' = {
   name: '${vault.name}-pe'
   location: location
   tags: tags
@@ -71,7 +69,7 @@ resource endpoint 'Microsoft.Network/privateEndpoints@2023-09-01' = if (!empty(p
   }
 }
 
-resource endpointDns 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2023-09-01' = if (!empty(privateEndpointSubnetId) && !empty(privateDnsZoneId)) {
+resource endpointDns 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2023-09-01' = {
   parent: endpoint
   name: 'default'
   properties: {

@@ -1,14 +1,13 @@
 using '../main.bicep'
 
-// Test: same shape as prod, cheaper retention, and the image is the one the pipeline publishes.
-// The image placeholder is replaced by the CD workflow before deployment.
+// Same private network shape as prod; use separate non-overlapping CIDRs for platform connectivity.
 param environment = 'test'
 param location = 'eastus'
-param namePrefix = 'meridian-payments'
-param containerImage = 'meridian-payments-test.azurecr.io/premium-payment-intake:replace-me'
-param postgresSkuName = 'Standard_B1ms'
-param postgresStorageSizeGb = 40
-param serviceBusSku = 'Standard'
+param postgresAdminGroupObjectId = '00000000-0000-0000-0000-000000000000'
+param postgresAdminGroupName = 'REPLACE-WITH-STAGE-DB-ADMINS'
+param vnetAddressPrefix = '10.21.0.0/16'
+param containerAppsSubnetPrefix = '10.21.0.0/23'
+param privateEndpointsSubnetPrefix = '10.21.4.0/24'
 param logRetentionInDays = 30
 param logDailyCapInGb = 2
 param keyVaultPurgeProtection = false

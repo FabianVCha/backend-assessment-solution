@@ -5,8 +5,9 @@
 @description('Object id of the managed identity that runs the workload.')
 param principalId string
 
-@description('Service Bus topic the publisher sends to.')
-param serviceBusTopicId string
+@description('Service Bus namespace and topic the publisher sends to.')
+param serviceBusNamespaceName string
+param serviceBusTopicName string
 
 @description('Key Vault that holds the Salesforce secret.')
 param keyVaultId string
@@ -25,7 +26,7 @@ var acrPull = '7f951dda-4ed3-4680-a7ca-43fe172d538d' // gitleaks:allow
 var monitoringMetricsPublisher = '3913510d-42f4-4e42-8a64-420c390055eb' // gitleaks:allow
 
 resource sendToTopic 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(serviceBusTopicId, principalId, serviceBusDataSender)
+  name: guid(topic.id, principalId, serviceBusDataSender)
   scope: topic
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', serviceBusDataSender)
@@ -66,9 +67,13 @@ resource publishMetrics 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
 
 // The scopes above are declared here as existing resources: a role assignment needs a scope, and the
 // scope is a resource that already exists by the time this module runs.
+resource serviceBus 'Microsoft.ServiceBus/namespaces@2022-10-01-preview' existing = {
+  name: serviceBusNamespaceName
+}
+
 resource topic 'Microsoft.ServiceBus/namespaces/topics@2022-10-01-preview' existing = {
-  name: last(split(serviceBusTopicId, '/topics/'))
-  scope: resourceGroup()
+  parent: serviceBus
+  name: serviceBusTopicName
 }
 
 resource vault 'Microsoft.KeyVault/vaults@2023-07-01' existing = {

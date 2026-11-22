@@ -16,7 +16,7 @@ param location string
 @description('Address space for the VNet. /16 leaves room for a second region without re-addressing.')
 param vnetAddressPrefix string
 
-@description('Container Apps integration subnet. Azure requires at least /23 for a consumption environment.')
+@description('Dedicated, delegated subnet for the workload-profiles Container Apps environment.')
 param containerAppsSubnetPrefix string
 
 @description('Private endpoint subnet.')
@@ -39,12 +39,21 @@ resource vnet 'Microsoft.Network/virtualNetworks@2023-09-01' = {
         name: 'snet-containerapps'
         properties: {
           addressPrefix: containerAppsSubnetPrefix
+          delegations: [
+            {
+              name: 'containerapps'
+              properties: {
+                serviceName: 'Microsoft.App/environments'
+              }
+            }
+          ]
         }
       }
       {
         name: 'snet-private-endpoints'
         properties: {
           addressPrefix: privateEndpointsSubnetPrefix
+          privateEndpointNetworkPolicies: 'Disabled'
         }
       }
     ]

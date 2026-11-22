@@ -1,14 +1,13 @@
 using '../main.bicep'
 
 // Production: purge protection on, longer retention, three replicas at most.
-// The image placeholder is replaced by the CD workflow before deployment.
 param environment = 'prod'
 param location = 'eastus'
-param namePrefix = 'meridian-payments'
-param containerImage = 'meridian-payments-prod.azurecr.io/premium-payment-intake:replace-me'
-param postgresSkuName = 'Standard_B1ms'
-param postgresStorageSizeGb = 40
-param serviceBusSku = 'Standard'
+param postgresAdminGroupObjectId = '00000000-0000-0000-0000-000000000000'
+param postgresAdminGroupName = 'REPLACE-WITH-STAGE-DB-ADMINS'
+param vnetAddressPrefix = '10.22.0.0/16'
+param containerAppsSubnetPrefix = '10.22.0.0/23'
+param privateEndpointsSubnetPrefix = '10.22.4.0/24'
 param logRetentionInDays = 90
 param logDailyCapInGb = 5
 param keyVaultPurgeProtection = true

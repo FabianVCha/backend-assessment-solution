@@ -1,6 +1,6 @@
 // Container Apps: the intake and both worker roles in one deployment, as ADR-0002 allows.
-// Consumption plan, internal ingress only (the API Manager is the only way in), one replica minimum
-// so a provider webhook is never answered by a cold start.
+// Internal workload-profiles environment with a Consumption profile. The app is reachable from
+// routed private networks, not the internet. API Manager connectivity is a platform prerequisite.
 
 @description('Prefix shared by every resource in this deployment.')
 param namePrefix string
@@ -11,8 +11,11 @@ param environment string
 @description('Azure region for the environment and the app.')
 param location string
 
-@description('Container image. The pipeline replaces the placeholder with the image it built.')
+@description('Approved release image pinned by digest. Not the assessment demo.')
 param image string
+
+param deployApplication bool
+param vnetId string
 
 @description('Subnet delegated to the Container Apps environment.')
 param containerAppsSubnetId string
@@ -26,6 +29,7 @@ param logAnalyticsSharedKey string
 
 @description('Managed identity the app runs as.')
 param identityId string
+param identityClientId string
 
 @description('Registry login server.')
 param registryLoginServer string
@@ -50,22 +54,27 @@ param applicationInsightsConnectionString string
 param minReplicas int
 param maxReplicas int
 
-@description('CPU and memory per replica. The workload is I/O bound: the signature and the mapping are microseconds.')
+@description('Starting CPU and memory per replica; validate under load.')
 param cpuCores string
 param memorySize string
 
 param tags object
 
-resource managedEnvironment 'Microsoft.App/managedEnvironments@2023-05-01' = {
+resource managedEnvironment 'Microsoft.App/managedEnvironments@2024-03-01' = {
   name: '${namePrefix}-${environment}-cae'
   location: location
   tags: tags
   properties: {
-    // Internal: the environment has no public endpoint at all. APIM reaches it over the VNet.
     vnetConfiguration: {
       infrastructureSubnetId: containerAppsSubnetId
       internal: true
     }
+    workloadProfiles: [
+      {
+        name: 'Consumption'
+        workloadProfileType: 'Consumption'
+      }
+    ]
     appLogsConfiguration: {
       destination: 'log-analytics'
       logAnalyticsConfiguration: {
@@ -77,7 +86,17 @@ resource managedEnvironment 'Microsoft.App/managedEnvironments@2023-05-01' = {
   }
 }
 
-resource app 'Microsoft.App/containerApps@2023-05-01' = {
+module ingressDns 'ingress-dns.bicep' = {
+  name: 'ingress-dns'
+  params: {
+    zoneName: managedEnvironment.properties.defaultDomain
+    privateIp: managedEnvironment.properties.staticIp
+    vnetId: vnetId
+    tags: tags
+  }
+}
+
+resource app 'Microsoft.App/containerApps@2024-03-01' = if (deployApplication) {
   name: '${namePrefix}-${environment}-intake'
   location: location
   tags: tags
@@ -88,11 +107,13 @@ resource app 'Microsoft.App/containerApps@2023-05-01' = {
     }
   }
   properties: {
-    managedEnvironmentId: managedEnvironment.id
+    environmentId: managedEnvironment.id
+    workloadProfileName: 'Consumption'
     configuration: {
       activeRevisionsMode: 'Single'
       ingress: {
-        external: false
+        // "External" is relative to the environment; this publishes on the internal load balancer.
+        external: true
         targetPort: 8080
         transport: 'http'
         allowInsecure: false
@@ -127,7 +148,40 @@ resource app 'Microsoft.App/containerApps@2023-05-01' = {
             cpu: json(cpuCores)
             memory: memorySize
           }
+          probes: [
+            {
+              type: 'Startup'
+              httpGet: {
+                path: '/healthz'
+                port: 8080
+              }
+              periodSeconds: 5
+              failureThreshold: 24
+            }
+            {
+              type: 'Readiness'
+              httpGet: {
+                path: '/readyz'
+                port: 8080
+              }
+              periodSeconds: 5
+              failureThreshold: 3
+            }
+            {
+              type: 'Liveness'
+              httpGet: {
+                path: '/healthz'
+                port: 8080
+              }
+              periodSeconds: 15
+              failureThreshold: 3
+            }
+          ]
           env: [
+            {
+              name: 'AZURE_CLIENT_ID'
+              value: identityClientId
+            }
             {
               name: 'SERVICE_BUS_FQDN'
               value: serviceBusNamespace
@@ -159,6 +213,8 @@ resource app 'Microsoft.App/containerApps@2023-05-01' = {
   }
 }
 
-output appId string = app.id
-output appName string = app.name
-output environmentId string = managedEnvironment.id
+output appId string = deployApplication ? app!.id : ''
+output appName string = deployApplication ? app!.name : ''
+output appFqdn string = deployApplication ? app!.properties.configuration.ingress.fqdn : ''
+output environmentPrivateIp string = managedEnvironment.properties.staticIp
+output environmentDnsZone string = managedEnvironment.properties.defaultDomain
