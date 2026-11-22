@@ -31,6 +31,19 @@ duplicates without creating additional jobs. The relay polls approximately every
 the timeline after the first tick to distinguish acceptance, the simulated canonical publication,
 and the simulated Salesforce result. This is a snapshot of milestones, not immutable attempt history.
 
+To populate the local operations table with a larger deterministic dataset, send exactly 200
+fictional notifications through the signed webhook endpoints:
+
+```sh
+python3 tools/local_demo.py seed --count 200
+```
+
+The generated records are distributed across Quetzal, Andina and Austral, use unique synthetic
+identifiers, and are accepted through the same public webhook path as the three reference samples.
+Running the command again reports duplicates rather than creating additional records. If the demo
+uses a non-default host port, pass it explicitly, for example
+`python3 tools/local_demo.py seed --port 18080 --count 200`.
+
 To issue a narrower or replay-enabled session, first export the values from your trusted local
 profile (`set -a; . ./.meridian.local.env; set +a`), then supply `OPS_TOKEN` using
 `python3 tools/local_demo.py token --country CO` or add `--replay` for the operator workflow. Use the integration
