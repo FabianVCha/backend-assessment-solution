@@ -1,0 +1,7 @@
+# Opt-in local identity profile. Do not deploy this overlay to Azure.
+services:
+  intake:
+    environment:
+      INTAKE_OPS_ISSUER: ${INTAKE_OPS_ISSUER:-meridian-local}
+      INTAKE_OPS_AUDIENCE: ${INTAKE_OPS_AUDIENCE:-intake-ops}
+      INTAKE_OPS_HS256_KEY_BASE64: ${INTAKE_OPS_HS256_KEY_BASE64:?Generate a disposable local key before enabling operations}
