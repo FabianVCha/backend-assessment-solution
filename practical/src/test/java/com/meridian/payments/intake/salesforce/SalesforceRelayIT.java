@@ -30,6 +30,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -75,7 +76,7 @@ class SalesforceRelayIT {
         execute("DELETE FROM outbox_job");
         execute("DELETE FROM payment_event");
         execute("DELETE FROM payment_state");
-        execute("TRUNCATE salesforce_budget, salesforce_budget_call");
+        execute("TRUNCATE salesforce_budget, salesforce_budget_call, salesforce_budget_lease");
     }
 
     @Test
@@ -147,7 +148,7 @@ class SalesforceRelayIT {
         SalesforceClient client = write -> {
             try {
                 duringCall[0] = count("SELECT sum(calls) FROM salesforce_budget");
-                duringCall[1] = count("SELECT sum(in_flight) FROM salesforce_budget");
+                duringCall[1] = count("SELECT count(*) FROM salesforce_budget_lease");
             } catch (SQLException e) {
                 throw new AssertionError(e);
             }
@@ -159,7 +160,7 @@ class SalesforceRelayIT {
         assertEquals(1, duringCall[0]);
         assertEquals(1, duringCall[1]);
         assertEquals(1, count("SELECT sum(calls) FROM salesforce_budget"));
-        assertEquals(0, count("SELECT sum(in_flight) FROM salesforce_budget"));
+        assertEquals(0, count("SELECT count(*) FROM salesforce_budget_lease"));
     }
 
     @Test
@@ -195,7 +196,9 @@ class SalesforceRelayIT {
     @Test
     void concurrencyLimitCountsRequestsThatStartedBeforeMidnight() throws SQLException {
         execute("""
-                INSERT INTO salesforce_budget VALUES ((now() AT TIME ZONE 'UTC')::date - 1, 25, 25)
+                INSERT INTO salesforce_budget VALUES ((now() AT TIME ZONE 'UTC')::date - 1, 25, 0);
+                INSERT INTO salesforce_budget_lease
+                SELECT gen_random_uuid(), now() + interval '1 minute' FROM generate_series(1, 25)
                 """);
         accept("evt-budget-busy", "B-4", "CAPTURED", Instant.EPOCH);
         SimulatedSalesforce salesforce = new SimulatedSalesforce();
@@ -204,7 +207,7 @@ class SalesforceRelayIT {
 
         assertEquals(0, salesforce.writeCount());
         assertEquals("state=PENDING, code=BUDGET_EXHAUSTED", jobState("evt-budget-busy"));
-        assertEquals(25, count("SELECT sum(in_flight) FROM salesforce_budget"));
+        assertEquals(25, count("SELECT count(*) FROM salesforce_budget_lease"));
         assertEquals(25, count("SELECT sum(calls) FROM salesforce_budget"));
     }
 
@@ -218,7 +221,7 @@ class SalesforceRelayIT {
                 () -> new SalesforceRelay(store, client, 10).drain()));
 
         assertEquals(1, count("SELECT sum(calls) FROM salesforce_budget"));
-        assertEquals(0, count("SELECT sum(in_flight) FROM salesforce_budget"));
+        assertEquals(0, count("SELECT count(*) FROM salesforce_budget_lease"));
     }
 
     @Test
@@ -232,7 +235,9 @@ class SalesforceRelayIT {
     @Test
     void twoReplicasCannotBothTakeTheLastConcurrentSlot() throws Exception {
         execute("""
-                INSERT INTO salesforce_budget VALUES ((now() AT TIME ZONE 'UTC')::date - 1, 24, 24)
+                INSERT INTO salesforce_budget VALUES ((now() AT TIME ZONE 'UTC')::date - 1, 24, 0);
+                INSERT INTO salesforce_budget_lease
+                SELECT gen_random_uuid(), now() + interval '1 minute' FROM generate_series(1, 24)
                 """);
         raceForLastSlot(25, 25, 24);
     }
@@ -269,7 +274,7 @@ class SalesforceRelayIT {
                 assertEquals(0, denied.get());
                 assertEquals(1, calls.get());
                 assertEquals(finalCalls, count("SELECT sum(calls) FROM salesforce_budget"));
-                assertEquals(inFlightDuringCall, count("SELECT sum(in_flight) FROM salesforce_budget"));
+                assertEquals(inFlightDuringCall, count("SELECT count(*) FROM salesforce_budget_lease"));
                 assertEquals(1, count("""
                         SELECT count(*) FROM outbox_job WHERE state = 'PENDING'
                             AND outcome_code = 'BUDGET_EXHAUSTED' AND attempts = 0 AND claim_token IS NULL
@@ -279,7 +284,7 @@ class SalesforceRelayIT {
                 var admitted = results.poll(10, TimeUnit.SECONDS);
                 assertNotNull(admitted);
                 assertEquals(1, admitted.get());
-                assertEquals(finalInFlight, count("SELECT sum(in_flight) FROM salesforce_budget"));
+                assertEquals(finalInFlight, count("SELECT count(*) FROM salesforce_budget_lease"));
             } finally {
                 release.countDown();
             }
@@ -313,14 +318,18 @@ class SalesforceRelayIT {
     }
 
     @Test
-    void aTimeoutIsRetriedBecauseItIsNotYetAmbiguous() throws SQLException {
+    void aTimeoutHoldsThePaymentUntilReconciliation() throws SQLException {
         accept("evt-sf-7", "PAY-7", "CAPTURED", Instant.parse("2026-12-01T10:00:00Z"));
         SimulatedSalesforce salesforce = new SimulatedSalesforce()
                 .failOnce("QZ-MX-PAY-7", SalesforceClient.Result.TIMEOUT);
 
         relay(salesforce).drain();
 
-        assertEquals("state=PENDING, code=TIMEOUT", jobState("evt-sf-7"));
+        assertEquals("state=HELD, code=TIMEOUT", jobState("evt-sf-7"));
+        accept("evt-sf-later", "PAY-7", "REFUNDED", Instant.parse("2026-12-01T11:00:00Z"));
+        accept("evt-sf-other", "PAY-other", "CAPTURED", Instant.EPOCH);
+        assertEquals(1, relay(salesforce).drain());
+        assertEquals("state=PENDING, code=null", jobState("evt-sf-later"));
     }
 
     @Test
@@ -334,6 +343,7 @@ class SalesforceRelayIT {
         relay(salesforce).drain();
 
         assertEquals("state=PUBLISHED, code=STALE_SKIPPED", jobState("evt-sf-old"));
+        assertEquals(1, relay(salesforce).drain());
         assertEquals("state=PUBLISHED, code=APPLIED", jobState("evt-sf-new"));
         assertEquals(1, salesforce.writeCount(), "the older fact never reached the destination");
         assertEquals("REFUNDED", salesforce.writes().get(0).status());
@@ -351,6 +361,92 @@ class SalesforceRelayIT {
 
         assertEquals(List.of(), store.claimDue(10, "worker-b", Duration.ofSeconds(30)),
                 "one writer per payment: the second worker waits for the lease to end");
+    }
+
+    @Test
+    void simultaneousClaimsTakeAtMostOneJobForThePayment() throws Exception {
+        accept("first", "SAME", "CAPTURED", Instant.EPOCH);
+        accept("second", "SAME", "REFUNDED", Instant.EPOCH.plusSeconds(1));
+        CountDownLatch start = new CountDownLatch(1);
+        try (Database second = Database.open(URL, USER, PASSWORD);
+             var workers = Executors.newFixedThreadPool(2)) {
+            var one = workers.submit(() -> {
+                await(start);
+                return store.claimDue(10, "one", Duration.ofSeconds(30));
+            });
+            var two = workers.submit(() -> {
+                await(start);
+                return new PostgresSalesforceStore(second).claimDue(10, "two", Duration.ofSeconds(30));
+            });
+            start.countDown();
+            assertEquals(1, one.get(10, TimeUnit.SECONDS).size() + two.get(10, TimeUnit.SECONDS).size());
+        }
+        assertEquals(1, count("SELECT count(*) FROM outbox_job WHERE state = 'CLAIMED'"));
+    }
+
+    @Test
+    void anExpiredClaimHoldsThePaymentAndRejectsStaleCompletion() throws SQLException {
+        accept("expired", "SAME", "CAPTURED", Instant.EPOCH);
+        var claim = store.claimDue(1, "old", Duration.ofSeconds(30)).getFirst();
+        accept("later", "SAME", "REFUNDED", Instant.EPOCH.plusSeconds(1));
+        execute("UPDATE outbox_job SET claim_expires_at = now() - interval '1 second' WHERE state = 'CLAIMED'");
+        assertFalse(store.canDispatch(claim));
+        assertThrows(ClaimLostException.class, () -> store.applied(claim));
+        assertEquals(List.of(), store.claimDue(10, "new", Duration.ofSeconds(30)));
+        assertEquals("state=HELD, code=CLAIM_EXPIRED", jobState("expired"));
+        assertEquals("state=PENDING, code=null", jobState("later"));
+    }
+
+    @Test
+    void sameTimeRefundTakesPrecedenceInEitherArrivalOrder() throws SQLException {
+        accept("refund-a", "TIE-A", "REFUNDED", Instant.EPOCH);
+        accept("capture-a", "TIE-A", "CAPTURED", Instant.EPOCH);
+        accept("capture-b", "TIE-B", "CAPTURED", Instant.EPOCH);
+        accept("refund-b", "TIE-B", "REFUNDED", Instant.EPOCH);
+        SimulatedSalesforce client = new SimulatedSalesforce();
+        var relay = relay(client);
+        assertEquals(1, relay.drain());
+        assertEquals(1, relay.drain());
+        assertEquals(List.of("REFUNDED", "REFUNDED"),
+                client.writes().stream().map(SalesforceClient.PaymentWrite::status).toList());
+        assertEquals("REFUNDED", remoteAppliedStatus("TIE-A"));
+        assertEquals("REFUNDED", remoteAppliedStatus("TIE-B"));
+    }
+
+    @Test
+    void failedProjectionUpdateDoesNotCommitJobCompletion() throws SQLException {
+        accept("evt-atomic", "ATOMIC", "CAPTURED", Instant.EPOCH);
+        var claim = store.claimDue(1, "worker", Duration.ofSeconds(30)).getFirst();
+        execute("""
+                CREATE FUNCTION reject_applied_projection() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN RAISE EXCEPTION 'projection write unavailable'; END $$;
+                CREATE TRIGGER reject_applied_projection BEFORE UPDATE ON payment_state
+                FOR EACH ROW EXECUTE FUNCTION reject_applied_projection()
+                """);
+        try {
+            assertThrows(com.meridian.payments.intake.store.StoreUnavailableException.class,
+                    () -> store.applied(claim));
+            assertEquals("state=CLAIMED, code=null", jobState("evt-atomic"));
+            assertNull(remoteAppliedStatus("ATOMIC"));
+        } finally {
+            execute("DROP TRIGGER reject_applied_projection ON payment_state; DROP FUNCTION reject_applied_projection()");
+        }
+    }
+
+    @Test
+    void expiredReservationsRecoverCapacityWithoutErasingCallHistory() throws SQLException {
+        for (int i = 0; i < 25; i++) {
+            assertTrue(store.tryAcquireBudget().isPresent());
+        }
+        assertTrue(store.tryAcquireBudget().isEmpty());
+        execute("UPDATE salesforce_budget_lease SET expires_at = now() - interval '1 second'");
+        var fresh = store.tryAcquireBudget().orElseThrow();
+        assertEquals(1, count("SELECT count(*) FROM salesforce_budget_lease"));
+        assertEquals(26, count("SELECT sum(calls) FROM salesforce_budget"));
+        assertEquals(26, count("SELECT count(*) FROM salesforce_budget_call"));
+        store.releaseBudget(fresh);
+        store.releaseBudget(fresh);
+        assertEquals(0, count("SELECT count(*) FROM salesforce_budget_lease"));
     }
 
     @Test

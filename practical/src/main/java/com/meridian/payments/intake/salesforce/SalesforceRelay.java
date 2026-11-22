@@ -5,7 +5,6 @@ import com.meridian.payments.intake.store.PendingJob;
 import com.meridian.payments.intake.store.SalesforceStore;
 
 import java.time.Duration;
-import java.time.LocalDate;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -19,9 +18,8 @@ import java.util.logging.Logger;
  *
  * <ul>
  *   <li><b>Nothing older than what the payment already has is written.</b> The projection is read before
- *       the call; an event whose provider timestamp is older is skipped and marked, not sent. A delayed
- *       capture must not overwrite a reversal that already landed.
- *   <li><b>A failed call is classified, not thrown.</b> Invalid field is terminal, a row lock is a retryable
+ *       the call; an event that loses the projection's ordering rule is skipped and marked, not sent.
+ *   <li><b>A classified response follows its own recovery rule.</b> Invalid field is terminal, a row lock is a retryable
  *       {@code 400}, an expired session is one refresh inside the client and a retry here, a rate limit
  *       stops the lane for the rest of the batch, and a lost response holds the payment instead of
  *       guessing.
@@ -78,7 +76,7 @@ public final class SalesforceRelay {
                     store.skipped(job);
                     continue;
                 }
-                Optional<LocalDate> reservation = store.tryAcquireBudget();
+                Optional<UUID> reservation = store.tryAcquireBudget();
                 if (reservation.isEmpty()) {
                     budgetExhausted = true;
                     deferForBudget(job);
@@ -86,7 +84,13 @@ public final class SalesforceRelay {
                 }
                 SalesforceClient.Result result;
                 try {
+                    if (!store.canDispatch(job)) {
+                        continue;
+                    }
                     result = client.write(writeOf(job));
+                } catch (RuntimeException e) {
+                    store.held(job, "CLIENT_FAILURE");
+                    throw e;
                 } finally {
                     store.releaseBudget(reservation.get());
                 }
@@ -97,18 +101,18 @@ public final class SalesforceRelay {
                     }
                     case INVALID_FIELD -> store.dead(job, "INVALID_FIELD");
                     case LOST_RESPONSE -> store.held(job, "LOST_RESPONSE");
+                    case TIMEOUT -> store.held(job, "TIMEOUT");
                     case RATE_LIMITED -> {
                         store.failed(job, "RATE_LIMITED");
                         rateLimited = true;
                     }
                     // Retryable: a locked row is a 400 that must be retried, an expired session is one
-                    // refresh inside the client, a partial batch left items behind, and a timeout or a 5xx
-                    // is worth another attempt before anyone calls it ambiguous.
+                    // refresh inside the client. Ambiguous outcomes must be mapped to LOST_RESPONSE
+                    // by an adapter; the simulator cannot establish the real destination's guarantees.
                     case PARTIAL -> store.failed(job, "PARTIAL");
                     case UNABLE_TO_LOCK_ROW -> store.failed(job, "UNABLE_TO_LOCK_ROW");
                     case SESSION_EXPIRED -> store.failed(job, "SESSION_EXPIRED");
                     case SERVER_ERROR -> store.failed(job, "SERVER_ERROR");
-                    case TIMEOUT -> store.failed(job, "TIMEOUT");
                 }
             } catch (ClaimLostException e) {
                 LOG.warning("a salesforce lease expired before completion; the job has another owner");
@@ -120,7 +124,7 @@ public final class SalesforceRelay {
     private boolean isOlderThanWhatThePaymentAlreadyHas(PendingJob job) {
         SalesforceStore.PaymentProjection projection = store.projection(job.event().paymentKey());
         return projection != null
-                && job.event().statusChangedAt().isBefore(projection.latestStatusChangedAt());
+                && !job.event().eventId().equals(projection.latestEventId());
     }
 
     private void deferForBudget(PendingJob job) {

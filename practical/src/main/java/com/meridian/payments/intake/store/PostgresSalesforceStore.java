@@ -13,7 +13,6 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
-import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
@@ -28,37 +27,39 @@ import java.util.UUID;
  * <p>Three properties live here, and each one is a question a reviewer should ask:
  *
  * <ol>
- *   <li><b>One writer per payment.</b> The claim excludes any job whose payment already has a write in
- *       flight, so two replicas do not push two facts for one payment at the same time. The exclusion is
- *       a filter on the claim query, checked under the same statement that takes the row; the residual
- *       window is documented rather than hidden — two claims can still begin in the same instant, and only
- *       the destination can close that completely.
+ *   <li><b>One claim per payment.</b> The claim transaction is serialized across replicas; it selects
+ *       at most one job for each payment and excludes keys with an active or held write. It does not
+ *       hold the database lock during a network call or fence writes at Salesforce.
  *   <li><b>Ordering by the provider's clock.</b> The relay reads the payment projection before it writes.
- *       An event older than the payment's newest fact is not written at all: a delayed capture must not
- *       replace a reversal that already landed.
+ *       An event that loses the deterministic ordering in the projection is not written.
  *   <li><b>Three ways to end.</b> Applied, terminal, or ambiguous. {@code HELD} is reserved for the last
  *       one; a timeout that might have landed is never marked failed and never marked done.
  * </ol>
  */
 public final class PostgresSalesforceStore implements SalesforceStore {
 
+    private static final String CLAIM_LOCK = "SELECT pg_advisory_xact_lock(141422, 2)";
+    private static final String HOLD_EXPIRED = """
+            UPDATE outbox_job SET state = 'HELD', outcome_code = 'CLAIM_EXPIRED',
+                claim_owner = NULL, claim_token = NULL, claim_expires_at = NULL
+            WHERE destination = 'SALESFORCE' AND state = 'CLAIMED'
+              AND claim_expires_at <= statement_timestamp()
+            """;
     private static final String CLAIMABLE = """
-            SELECT o.outbox_id
-            FROM outbox_job o
-            JOIN payment_event e ON e.intake_id = o.intake_id
-            WHERE o.destination = 'SALESFORCE'
-              AND ((o.state = 'PENDING' AND o.next_attempt_at <= now())
-                   OR (o.state = 'CLAIMED' AND o.claim_expires_at <= now()))
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM outbox_job flight
-                  JOIN payment_event other ON other.intake_id = flight.intake_id
-                  WHERE flight.destination = 'SALESFORCE'
-                    AND other.payment_key = e.payment_key
-                    AND flight.outbox_id <> o.outbox_id
-                    AND flight.state = 'CLAIMED'
-                    AND flight.claim_expires_at > now())
-            ORDER BY o.next_attempt_at, o.outbox_id
+            WITH eligible AS (
+                SELECT DISTINCT ON (e.payment_key) o.outbox_id, o.next_attempt_at
+                FROM outbox_job o JOIN payment_event e USING (intake_id)
+                WHERE o.destination = 'SALESFORCE'
+                  AND o.state = 'PENDING' AND o.next_attempt_at <= statement_timestamp()
+                  AND NOT EXISTS (
+                      SELECT 1 FROM outbox_job blocked JOIN payment_event other USING (intake_id)
+                      WHERE blocked.destination = 'SALESFORCE' AND other.payment_key = e.payment_key
+                        AND blocked.state IN ('CLAIMED', 'HELD'))
+                ORDER BY e.payment_key, o.next_attempt_at, o.outbox_id
+            )
+            SELECT o.outbox_id FROM eligible JOIN outbox_job o USING (outbox_id)
+            WHERE o.state = 'PENDING'
+            ORDER BY eligible.next_attempt_at, o.outbox_id
             LIMIT ?
             FOR UPDATE OF o SKIP LOCKED
             """;
@@ -66,7 +67,7 @@ public final class PostgresSalesforceStore implements SalesforceStore {
     private static final String MARK_CLAIMED = """
             UPDATE outbox_job
             SET state = 'CLAIMED', claim_owner = ?, claim_token = CAST(? AS uuid),
-                claim_expires_at = now() + make_interval(secs => ?)
+                claim_expires_at = statement_timestamp() + make_interval(secs => ?)
             WHERE outbox_id = ANY(?)
             """;
 
@@ -79,7 +80,7 @@ public final class PostgresSalesforceStore implements SalesforceStore {
             """;
 
     private static final String PROJECTION = """
-            SELECT latest_status, latest_status_changed_at, remote_applied_status
+            SELECT latest_status, latest_status_changed_at, remote_applied_status, latest_event_id
             FROM payment_state WHERE payment_key = ?
             """;
 
@@ -92,6 +93,7 @@ public final class PostgresSalesforceStore implements SalesforceStore {
             WHERE o.intake_id = e.intake_id
               AND e.provider = ? AND e.event_id = ? AND o.destination = 'SALESFORCE'
               AND o.claim_token = CAST(? AS uuid)
+              AND o.claim_expires_at > statement_timestamp()
             """;
 
     private static final String MARK_APPLIED = """
@@ -108,6 +110,7 @@ public final class PostgresSalesforceStore implements SalesforceStore {
             WHERE o.intake_id = e.intake_id
               AND e.provider = ? AND e.event_id = ? AND o.destination = 'SALESFORCE'
               AND o.claim_token = CAST(? AS uuid)
+              AND o.claim_expires_at > statement_timestamp()
             """;
 
     private static final String BUDGET_DEFER = """
@@ -119,6 +122,14 @@ public final class PostgresSalesforceStore implements SalesforceStore {
             WHERE o.intake_id = e.intake_id
               AND e.provider = ? AND e.event_id = ? AND o.destination = 'SALESFORCE'
               AND o.claim_token = CAST(? AS uuid)
+              AND o.claim_expires_at > statement_timestamp()
+            """;
+
+    private static final String DISPATCHABLE = """
+            SELECT 1 FROM outbox_job o JOIN payment_event e USING (intake_id)
+            WHERE e.provider = ? AND e.event_id = ? AND o.destination = 'SALESFORCE'
+              AND o.state = 'CLAIMED' AND o.claim_token = CAST(? AS uuid)
+              AND o.claim_expires_at > statement_timestamp()
             """;
 
     private static final ObjectMapper JSON = new ObjectMapper();
@@ -132,13 +143,29 @@ public final class PostgresSalesforceStore implements SalesforceStore {
     }
 
     @Override
-    public Optional<LocalDate> tryAcquireBudget() {
+    public Optional<UUID> tryAcquireBudget() {
         return budget.tryAcquire();
     }
 
     @Override
-    public void releaseBudget(LocalDate day) {
-        budget.release(day);
+    public void releaseBudget(UUID token) {
+        budget.release(token);
+    }
+
+    @Override
+    public boolean canDispatch(PendingJob job) {
+        requireClaim(job);
+        try (Connection connection = database.connection();
+             PreparedStatement statement = connection.prepareStatement(DISPATCHABLE)) {
+            statement.setString(1, job.job().provider().name());
+            statement.setString(2, job.job().eventId());
+            statement.setString(3, job.claimToken());
+            try (var rows = statement.executeQuery()) {
+                return rows.next();
+            }
+        } catch (SQLException e) {
+            throw new StoreUnavailableException("Salesforce dispatch ownership could not be checked", e);
+        }
     }
 
     @Override
@@ -170,6 +197,11 @@ public final class PostgresSalesforceStore implements SalesforceStore {
         try (Connection connection = database.connection()) {
             connection.setAutoCommit(false);
             try {
+                // Separate statements give this transaction a fresh snapshot after another claimant commits.
+                try (var lock = connection.createStatement()) {
+                    lock.execute(CLAIM_LOCK);
+                    lock.executeUpdate(HOLD_EXPIRED);
+                }
                 List<Long> ids = new ArrayList<>();
                 try (PreparedStatement statement = connection.prepareStatement(CLAIMABLE)) {
                     statement.setInt(1, limit);
@@ -228,7 +260,7 @@ public final class PostgresSalesforceStore implements SalesforceStore {
                 return new PaymentProjection(
                         rows.getString("latest_status"),
                         rows.getObject("latest_status_changed_at", OffsetDateTime.class).toInstant(),
-                        rows.getString("remote_applied_status"));
+                        rows.getString("remote_applied_status"), rows.getString("latest_event_id"));
             }
         } catch (SQLException e) {
             throw new StoreUnavailableException("the payment projection could not be read", e);
@@ -238,12 +270,22 @@ public final class PostgresSalesforceStore implements SalesforceStore {
     @Override
     public void applied(PendingJob job) {
         Objects.requireNonNull(job, "job");
-        complete(job, "PUBLISHED", "APPLIED");
-        try (Connection connection = database.connection();
-             PreparedStatement statement = connection.prepareStatement(MARK_APPLIED)) {
-            statement.setString(1, job.event().status());
-            statement.setString(2, job.event().paymentKey());
-            statement.executeUpdate();
+        try (Connection connection = database.connection()) {
+            connection.setAutoCommit(false);
+            try {
+                complete(connection, job, "PUBLISHED", "APPLIED");
+                try (PreparedStatement statement = connection.prepareStatement(MARK_APPLIED)) {
+                    statement.setString(1, job.event().status());
+                    statement.setString(2, job.event().paymentKey());
+                    if (statement.executeUpdate() != 1) {
+                        throw new SQLException("missing payment projection");
+                    }
+                }
+                connection.commit();
+            } catch (SQLException | RuntimeException e) {
+                rollbackQuietly(connection);
+                throw e;
+            }
         } catch (SQLException e) {
             throw new StoreUnavailableException("the applied status could not be recorded", e);
         }
@@ -283,10 +325,17 @@ public final class PostgresSalesforceStore implements SalesforceStore {
     }
 
     private void complete(PendingJob job, String state, String code) {
-        Objects.requireNonNull(job, "job");
+        try (Connection connection = database.connection()) {
+            complete(connection, job, state, code);
+        } catch (SQLException e) {
+            throw new StoreUnavailableException("the salesforce lane could not be completed", e);
+        }
+    }
+
+    private static void complete(Connection connection, PendingJob job, String state, String code)
+            throws SQLException {
         requireClaim(job);
-        try (Connection connection = database.connection();
-             PreparedStatement statement = connection.prepareStatement(COMPLETE)) {
+        try (PreparedStatement statement = connection.prepareStatement(COMPLETE)) {
             statement.setString(1, state);
             statement.setString(2, code);
             statement.setString(3, state);
@@ -296,8 +345,6 @@ public final class PostgresSalesforceStore implements SalesforceStore {
             if (statement.executeUpdate() == 0) {
                 throw new ClaimLostException("the lease on " + job.job() + " belongs to another worker now");
             }
-        } catch (SQLException e) {
-            throw new StoreUnavailableException("the salesforce lane could not be completed", e);
         }
     }
 
