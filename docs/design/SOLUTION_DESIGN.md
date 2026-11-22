@@ -4,6 +4,12 @@
 > compliance, implementation readiness or completion of Parts B–F; A2 and A6 remain open.
 > Sections marked `PENDING` are open decisions, not oversights.
 > Related ADRs: `docs/adr/0001-salesforce-integration.md` (Accepted), `docs/adr/0002-stack-and-datastore.md` (Accepted, amended 2026-11-21).
+>
+> **Target vs. demonstration:** This document describes the production target for all three
+> countries. The local Java demonstration uses environment-provided secrets and JDBC PostgreSQL
+> (or explicitly opted-in volatile storage), a recording broker and simulated Salesforce. It
+> exercises the flow locally, not production adapters, throughput or SLOs. The optional local
+> terminal console is a way to explore the demo, not the production Operations identity boundary.
 
 ## 1. Context
 
@@ -21,7 +27,7 @@ Out of scope by requirement:
 
 - Policy reinstatement. Salesforce automation owns it. **The integration never writes `Policy__c.Status__c`.**
 - The downstream consumers (Finance, Notifications). They subscribe to the canonical event on their own.
-- Salesforce write behaviour in the code deliverable of Part B (designed here, implemented nowhere).
+- Live Salesforce writes in Part B; the repository's local relay only exercises simulated outcomes.
 
 ### 1.2 System context
 
@@ -43,7 +49,7 @@ flowchart LR
     DB[("PostgreSQL Flexible<br/>inbox / state / outbox")]
     RELAY["Salesforce relay<br/>(logical role: polls SALESFORCE)"]
     PUB["Event publisher<br/>(logical role: polls CANONICAL_EVENT)"]
-    TOPIC["Service Bus Standard<br/>topic + subscriptions"]
+    TOPIC["Service Bus Premium<br/>private topic + subscriptions"]
     KV["Key Vault"]
     OBS["App Insights + Log Analytics"]
   end
@@ -61,7 +67,7 @@ flowchart LR
   QZ -->|HTTPS POST + HMAC| APIMGR
   AN -->|HTTPS POST + HMAC| APIMGR
   AU -->|HTTPS POST + HMAC| APIMGR
-  APIMGR --> INTAKE
+  APIMGR -->|Private HTTPS; original body and signature headers| INTAKE
   INTAKE -->|"tx: inbox + 2 outbox jobs"| DB
   RELAY -->|"poll SALESFORCE destination"| DB
   PUB -->|"poll CANONICAL_EVENT destination"| DB
@@ -73,7 +79,7 @@ flowchart LR
   KV -.-> INTAKE
   KV -.-> RELAY
   KV -.-> PUB
-  IDP -.->|M2M token| RELAY
+  IDP -.->|Token issuer for Operations clients| APIMGR
   INTAKE -.-> OBS
   RELAY -.-> OBS
   PUB -.-> OBS
@@ -84,10 +90,10 @@ Trust boundaries and what crosses them:
 | Boundary | What crosses | Control |
 |---|---|---|
 | Internet → API Manager | Prefixed webhook calls | Signature verification inside the intake service; the API Manager terminates TLS and applies rate limits and IP policy |
-| API Manager → intake | Normalised HTTP call | Network isolation; the intake service is not reachable from the internet |
-| Intake → Azure services | Provider payload, canonical event | Managed identity, least privilege |
+| API Manager → intake | Original signed bytes and provider signature headers | TLS end to end; API Manager uses routed private connectivity and private DNS to the internal Container Apps load balancer. Do not parse or reserialize signed bytes. Restrict private ingress to approved gateway sources; an internal environment alone is not an authorization boundary. |
+| Intake → Azure services | Canonical event, secrets, database traffic | Private endpoints for PostgreSQL, Service Bus and Key Vault; managed identity with least privilege |
 | Azure → Salesforce | Payment records | OAuth 2.0 client credentials, client secret in Key Vault |
-| Topic → downstream consumers | Canonical events | One subscription per consumer with its own credentials and filters; publication is at-least-once and consumption is outside this design's scope |
+| Topic → downstream consumers | Canonical events | Routed private access and subscription-scoped Entra receiver roles; publication is at-least-once and consumers are out of implementation scope |
 | Operations → query API | Lookup by provider identifier | OIDC token, scope `payments:read`, country claim filter, audit (§7) |
 
 ### 1.3 Design principles
@@ -127,20 +133,26 @@ sequenceDiagram
   participant N as Notifications subscription
 
   P->>A: POST /webhooks/{country}/{provider}
-  A->>I: forward (TLS terminated)
+  A->>I: private HTTPS (preserve body and signature headers)
   I->>I: verify signature using raw body
 
   alt signature invalid or timestamp outside tolerance
-    I-->>P: 401 (not persisted, only a hash is logged)
+    I-->>A: 401 (no payment persisted)
+    A-->>P: 401
   else valid
     I->>I: normalise to canonical event
     I->>D: BEGIN / insert payment_event / insert outbox SALESFORCE / insert outbox CANONICAL_EVENT
     alt unique violation on (provider, event_id)
       D-->>I: duplicate
-      I-->>P: 200 (idempotent success, no new jobs)
-    else committed
+      I-->>A: 200 (MX/CL) or 204 (CO), no new jobs
+      A-->>P: provider-specific duplicate acknowledgment
+    else commit fails
+      I-->>A: 503
+      A-->>P: 503 (retry, not accepted)
+    else commit confirmed
       D-->>I: both outbox jobs pending
-      I-->>P: 2xx (accepted, durable)
+      I-->>A: 200 (accepted, durable)
+      A-->>P: 200
     end
   end
 
@@ -148,15 +160,17 @@ sequenceDiagram
   R->>D: claim SALESFORCE rows (lease, SKIP LOCKED, up to 200)
   R->>R: resolve ordering against payment_state
   R->>S: PATCH composite/sobjects/Premium_Payment__c/Payment_Key__c
-  alt 200 / 201 / 204
+  alt Collection response with per-record results
     S-->>R: per-record results
-    R->>D: mark rows done, update payment_state
+    R->>D: persist each result; update payment_state for confirmed writes
   else 403 REQUEST_LIMIT_EXCEEDED
     S-->>R: org-wide limit hit
     R->>D: release claim untouched, open breaker
-  else 503 or timeout
+  else known non-write or systemic outage
     S-->>R: unavailable
-    R->>D: increment attempt, schedule backoff
+    R->>D: retry known non-write or pause on open circuit
+  else unknown write outcome
+    R->>D: hold payment key until remote outcome is reconciled
   end
 
   Note over D,U: Publication lane: independent claim and retries
@@ -180,15 +194,22 @@ Failure paths and their destinations:
 |---|---|---|---|
 | Invalid signature | Intake, before parsing | `401`, nothing persisted | Provider retries; that is correct |
 | Timestamp outside tolerance | Intake | `401` | Quetzal 300 s, Andina 10 min, Austral has no timestamp |
-| Duplicate delivery | Intake, unique index | `200`, no new jobs | Provider stops retrying |
-| Store unavailable or commit fails | Intake | `5xx` | Provider retries; nothing is lost (NFR3) |
+| Duplicate delivery | Intake, unique index | `200` (MX/CL) or `204` (CO), no new jobs | Provider stops retrying |
+| Store unavailable or commit fails | Intake | `503` | No acceptance acknowledged; provider retries. Reconcile if it exhausts its retry window. |
 | Broker publish fails or its ack is lost | Publisher | Row retried with backoff; duplicate possible | None, the event is already accepted |
 | Broker accepts but a consumer fails | Subscription consumer (out of scope) | Subscription dead-letter, consumer-owned | None; a broker ack was never consumer processing |
-| Salesforce unavailable | Relay | Retry with backoff, then dead-letter | None; publication continues independently |
+| Salesforce unavailable | Relay | Open the shared dependency circuit; resume queued work after a successful probe. Isolated retry exhaustion goes to dead-letter. | None; publication continues independently |
 | API budget exhausted | Relay | Circuit breaker, drain paused | None; publication continues |
 | Policy not found in Salesforce | Relay (`400 INVALID_FIELD`) | Dead-letter with reason; canonical event still published | None; replay after the policy exists |
 | Partial refund (`refund_scope = PARTIAL`) | Intake/relay classification | Canonical event published; Salesforce write withheld; manual review | None, the event is accepted |
 | Stale or out-of-order event | Relay ordering guard | Canonical event published; `payment_state` untouched; `ordering_outcome = STALE` | None |
+
+The production publisher retries transient send failures with the same `MessageId`, using
+jittered exponential delays (start at 1 s, cap at 5 min, up to 12 send attempts before parking in
+the outbox DLQ). During systemic broker unavailability, pause claims and probe rather than burning
+all attempts. Permanent serialization, size or configuration errors require diagnosis before
+replaying. This outbox DLQ is separate from each subscriber's broker DLQ, whose consumers own
+their retry and replay. The Salesforce-specific taxonomy is in ADR-0001.
 
 ## 3. Canonical payment event
 
@@ -420,9 +441,10 @@ can suspend it again, a wrong status is not a data-quality issue, it is a covera
 
 ### 4.3 Replay
 
-Replay is safe by construction: every reprocessed event is deduplicated at level 1 and every
-Salesforce write is an upsert on an immutable `Payment_Key__c`. Replaying a dead-letter queue in
-`status_changed_at` order per `payment_key` converges to the same final state.
+Replay requeues an existing destination job, not another intake event. Salesforce replay checks
+the persisted outcome and current ordering, then upserts on the immutable `Payment_Key__c`.
+Resolve ambiguous remote outcomes before replaying sends; merely sorting a DLQ by
+`status_changed_at` does not protect the live stream against stale writes.
 
 Replaying the publication destination is safe to repeat in the same sense: the same `MessageId` is
 produced and a consumer that already saw the event deduplicates on `(provider, event_id)`. It does not
@@ -442,8 +464,12 @@ who knows the data model will ask.
 
 ## 5. Persistence outside Salesforce
 
-Store: **Azure Database for PostgreSQL Flexible Server, B1MS (burstable), fixed billing**
+Store: **Azure Database for PostgreSQL Flexible Server; B1MS (burstable) is a sizing candidate**
 (see ADR-0002 for the cost comparison and why the serverless tier was discarded).
+
+The table names and columns below describe the logical model. The local migrations use
+`payment_event` (including canonical JSON), `outbox_job` and `payment_state` and add dispatch,
+replay and audit bookkeeping. Production database sizing must include those structures and indexes.
 
 | Table | Purpose | Key / uniqueness | Written by |
 |---|---|---|---|
@@ -481,20 +507,20 @@ instance** (`worker_lease`, renewed every 10 s, takeover after 30 s) because ord
 across workers; within that instance it may use up to 4 concurrent Salesforce requests, and it keeps a
 `payment_key` in at most one in-flight batch. The publisher may run several instances because
 publication has no ordering requirement. If the relay is ever scaled out, per-payment serialization
-has to be added first; this design does not claim it. A process that pauses longer than its lease and
-then resumes is a residual dual-writer risk: the relay stops writing when it cannot renew the lease,
-and the lease is longer than the Salesforce call timeout.
+has to be added first; this design does not claim it. A lease or client timeout alone cannot fence
+a request already sent to Salesforce. Hold a payment key after an ambiguous send and reconcile the
+Salesforce marker (`Last_Event_Id__c`, `Status_Changed_At__c`) before allowing a newer state.
 
 **Ordering is applied in the relay, not by Salesforce.** A batch may contain several states of the
 same payment. The relay groups by `payment_key`, drops the events the §4.2 rule would reject, and
-sends only the winner. `payment_state` is updated with a guarded upsert on `payment_key` that applies
-only when `status_changed_at` is newer (or equal with a higher rank), so a replayed or overlapping
-batch converges to the same winner. A replayed batch after a crash is safe: the upsert is idempotent
-and the guard rejects the older event.
+sends only the winner. The guarded local update rejects the older state, and the immutable
+external ID prevents duplicate Salesforce records, but neither prevents a late remote overwrite.
+Before release, validate outcome reconciliation and serialization on timeout and takeover; if the
+integration cannot exclude a late write, require a Salesforce-side monotonic write guard.
 
-Partitioning: none by throughput. The expected volume does not justify it. If the per-country
-retention rules later require it, partition `payment_event` by `country`, and keep the unique index
-independent of the partition key so a duplicate cannot hide in another partition.
+Partitioning: none by throughput. If retention later requires partitioning, preserve global
+deduplication explicitly, for example in an unpartitioned identity table written in the same
+transaction. PostgreSQL cannot enforce uniqueness across partitions without the partition key.
 
 ### 5.1 Retention (A2)
 
@@ -551,11 +577,9 @@ so they accumulate at two rows per accepted event; that accumulation is included
 window.
 
 **Storage consequence of no purge.** The 13-month window is a hot-data horizon, not a deletion date
-(above), so the store keeps growing at ≈1.6 GB of live data per month. 40 GB of provisioned storage
-covers ≈13 months with headroom, but the same estimate reaches 40 GB at roughly 19 months once the
-30% WAL/bloat overhead is included. The future archive is the intended exit; until it exists, storage
-must be increased or rows retired under A2. This is a capacity risk to track, not an implemented
-archive.
+(above), so storage grows until archive or purge exists. See §6.4 for the planning envelope and
+measurement gates. Until an approved lifecycle exists, storage must be increased as needed. That
+buys time; it is not an implemented archive.
 
 ## 6. Capacity
 
@@ -587,8 +611,9 @@ Sizing every day as a peak day overstates the month by about 4x and was the sour
 | `outbox` | INSERT | 2 | one `SALESFORCE`, one `CANONICAL_EVENT` |
 | `payment_state` | UPSERT | 1 for an applied event, 0 for a stale one | first event for a payment inserts; later applied events update |
 | `outbox` | UPDATE | 2 per row | claim/lease and completion; a retry adds another claim+completion cycle |
+| `payment_event` | UPDATE | 1 when ordering outcome is persisted on the event | count it separately from both job updates |
 
-An accepted event therefore costs **3 inserts + 1 state upsert + 4 outbox updates** in the normal
+An accepted event therefore costs **3 inserts + 1 state upsert + 4 outbox updates + 1 outcome update** in this model
 path (claim and completion on each of the two destination rows). A Salesforce retry adds another
 claim-and-completion cycle on that row (2 updates) without adding rows. Two outbox rows per event is a
 row count, not a batch count: batching reduces Salesforce and broker calls, not rows written.
@@ -599,13 +624,15 @@ row count, not a batch count: batching reduces Salesforce and broker calls, not 
 |---|---|---|---|
 | Unique events | ≈850,300 | 116,400 | 38.8/s |
 | Inserts (inbox + outbox + `payment_state` insert) | ≈3.32 M | 455,018 | ≈152/s |
-| Updates (`payment_state` update + outbox claim/completion) | ≈3.48 M | 476,182 | ≈159/s |
-| Total row writes | ≈6.80 M | 931,200 | ≈310/s |
+| Updates (`payment_state` update + outbox claim/completion + ordering outcome) | ≈4.33 M | 592,582 | ≈198/s |
+| Total row writes | ≈7.65 M | 1,047,600 | ≈349/s |
 | `payment_state` inserts / updates | 773,002 / 77,300 | 105,818 / 10,582 | 35.3 / 3.5 per s |
 
-At the burst, the volume model writes ≈152 inserts/s and ≈310 row operations/s, because the event
-writes two outbox rows and each of them is claimed and completed. That is the number a load test has
-to exercise.
+The burst implies ≈152 inserts/s and ≈349 logical row writes/s before retries, audit and dispatch
+metadata. Benchmark the complete path with realistic indexes and aged data, a 15-minute 40/s burst,
+3% duplicates, concurrent workers and a recovering backlog. Measure per-provider acknowledgment
+latency against 5 s (CO) and 10 s (MX/CL), pool waits, WAL, IOPS and credits. If the B1MS or HTTP-only
+scaler cannot pass, raise the database tier and size the workers independently before release.
 
 ### 6.4 Storage
 
@@ -613,45 +640,67 @@ Planning row sizes include data and indexes; they are estimates, not measurement
 
 | Table | Rows at 13 months | Bytes/row | Size |
 |---|---|---|---|
-| `payment_event` | 11.05 M | 700 | 7.7 GB |
-| `outbox` | 22.11 M | 450 | 9.9 GB |
-| `payment_state` | 10.05 M | 300 | 3.0 GB |
-| **Live data** | | | **20.7 GB** |
-| WAL, index bloat, backup working set (+30%) | | | 26.9 GB |
+| `payment_event` (including canonical JSON) | 11.05 M | 1,500 | 16.6 GB |
+| `outbox` | 22.11 M | 800 | 17.7 GB |
+| `payment_state` | 10.05 M | 450 | 4.5 GB |
+| **Live data** | | | **38.8 GB** |
+| **Subtotal with 30% headroom** for WAL and bloat | | | **50.4 GB** |
 
-40 GB of provisioned storage covers 13 months with headroom. No purge runs and the archive is not
-implemented, so live data grows ≈1.6 GB/month (≈2.1 GB with the same 30% overhead); the same 40 GB is
-exhausted at roughly 19 months. Alert at 75% and 85% of provisioned storage. Backup storage is
-separate and is not sized here. This is not a legal retention period: §5.1 and A2 remain open.
+Start at the 64 GB disk tier for the prototype cloud sizing. The estimate grows by ≈3.9 GB/month
+including headroom and would reach 64 GB in ≈16–17 months without purge or autogrow, excluding
+replay/audit/dispatch volume. Measure relation, index and WAL sizes on production-shaped data before
+committing to the disk tier; alert at 75% and 85%. Backup storage is separate and not sized here.
+The 13 months is a hot-data planning horizon, not a legal retention period (§5.1 and A2).
 
 ### 6.5 Salesforce calls, freshness and availability
 
 | Metric | Value | Source |
 |---|---|---|
-| Unique events per peak day | 116,400 | 120,000 × 97% |
-| Collection calls per day, theoretical minimum | 582 | 116,400 / 200 |
-| Collection calls per day, worst case | 1,440 | one flush per minute |
-| Salesforce API budget | 150,000 calls / rolling 24 h | API_CONSTRAINTS |
-| Budget utilisation | ≤1% | 1,440 / 150,000 |
-| Concurrent requests | 4 of 25 | API_CONSTRAINTS; one relay instance |
+| Once-through peak-day model | 116,400 events; ≥582 calls at 200 records/call if all events are applied |
+| Once-through call envelope | ≤2,022 per peak day; ≤2,604 in rolling 24 h if it straddles two full 116,400-event days |
+| Burst demand | 38.8 unique/s ≈ 12 full 200-record calls/minute while backlog forms |
+| Hard integration budget | 150,000 REST calls / rolling 24 h; request at most four concurrent writes of the 25 allowed |
 
-**Freshness (NFR2).** The relay flushes on `min(200 records, 60 seconds)`. The time condition is
-mandatory: at the overnight rate of ~0.17 notifications/s, filling a 200-record batch would take 20
-minutes and breach the 5-minute target for 95% of payments. With a 60-second flush plus a p95
-collection-upsert latency of 4 s, the 5-minute target holds when Salesforce is available. The
-publication lane does not inherit the 60-second window: the publisher flushes on
-`min(200 messages, 1 second)`, so FR6 is not delayed by the Salesforce batching policy.
+The call envelope assumes one shared batch builder, full batches released immediately plus at most
+one partial flush per minute, no retries or ancillary calls and no ordering/key constraints that
+split batches early. It is `ceil(N/200) + 1,440` under those assumptions, not a worst case. The
+rolling peak estimate is <2% of budget before retries/other calls. Even at 100 records per batch
+the same rolling model is 3,768 calls (~2.5%). Measure actual batch occupancy; count retries,
+probes and other REST calls in a shared rolling budget guard and stop on org-wide `403` even if the
+integration's own budget has room. Recovery traffic counts too.
 
-**Availability budget (NFR5).** 97% monthly availability is ~21.9 hours of unavailability a month.
-Since the 5-minute freshness target only has to hold for 95% of payments, roughly 36.5 hours of the
-month may be late; the availability budget fits inside the freshness allowance with margin. During
-an outage the backlog accumulates in `outbox` and drains afterwards, and the lateness is attributed
-to the Salesforce SLO, not hidden.
+**Freshness (NFR2).** Target flush: at 200 records or 60 s, whichever comes first. At the normal
+average of ~0.17 notifications/s, a size-only flush waits about 20 minutes. For healthy traffic
+with no aged backlog, allocate up to 60 s from provider notification to commit, 60 s for batch wait
+and 60 s for dispatch, acknowledgment and observation of visibility; that is a 3-minute planning
+budget, leaving 2 minutes before the 5-minute threshold. Salesforce's reference p95 of 4 s for a
+collection call is an input, not an end-to-end percentile. Measure both freshness thresholds per
+country using provider notification time where available, and separately measure receipt-to-visible
+latency; for missing timestamps report coverage rather than silently substituting a better clock.
+Count late/unresolved work in the denominator and break out outages and review holds as causes.
+The independent broker lane targets up to 200 messages per flush or a 1 s timer; this is not the
+local demo's cadence.
 
-**The real ceiling is the shared budget.** 150,000 calls/day at 200 records per call is 30 million
-records a day, about 250x the current peak. But the limit is org-wide: when any integration exceeds
-it, Salesforce returns `403 REQUEST_LIMIT_EXCEEDED` to every integration until usage recovers. The
-relay therefore needs a circuit breaker and a per-integration usage guard, not just a retry policy.
+**Recovery and the 97% dependency (NFR5).** Uptime is a fraction of time; freshness is a fraction
+of payments. There is no conversion between them without a traffic/outage model. A 90-minute
+Salesforce outage starting with the 15-minute burst makes at least 34,920 accepted events wait
+more than one hour before writing resumes (~4.1% of the average month's accepted events at event
+grain, **before** drain); verify the actual per-payment/per-country fraction by joining the
+projection. Even with uniform traffic, ≥1-hour outages can violate the 99.5% objective depending
+on their distribution. The backlog protects durability, not freshness.
+
+As a conservative recovery example, a 90-minute outage with one burst plus 75 minutes at the
+peak-day average puts ≈41,000 events in the backlog. If testing shows four concurrent writers can
+sustain 100 successful records every 8 s each, gross drain is 50/s; at 1.35/s new arrivals, modeled
+catch-up is ≈14 minutes, or ≈61 minutes if new arrivals stayed at 38.8/s throughout recovery.
+Neither is a guarantee; timeout, concurrency, rate limits, repeated payment keys and data holds
+reduce throughput. Validate drain, oldest-job age and causal ordering in load and failure tests;
+negotiate dependency availability/freshness or an alternative business view before promising NFR2.
+
+**Local evidence limit.** One demo process polls every 10 s, up to 50 broker jobs and 25 simulated
+Salesforce jobs per poll (~5/s and ~2.5/s maximum before work time). One 15-minute burst would add
+at least ~30,420 broker jobs and ~32,670 simulator jobs net of those caps. The demo is not a burst
+implementation, even when PostgreSQL durability works locally.
 
 ### 6.6 Broker volume
 
@@ -659,8 +708,11 @@ One message is published per accepted event. That is ≈850,300 messages/month, 
 and ≈39/s during the burst. Each of the two subscriptions receives its own copy, so the consumers see
 twice that volume; their processing and dead-letter costs are outside this design. Publication is
 at-least-once, so a retry can add a duplicate; broker duplicate detection is an optimisation, not the
-guarantee. The Standard tier supports topics and subscriptions; its full price, including messaging
-operations and brokered connections, is quoted in Part C.
+guarantee. Premium supports topics and the required private endpoint. A seven-day window containing
+four peak and three normal days could build ~509,250 messages per subscription. At 1.5 KB/message
+budget ~1.53 GB of payload across two copies, before broker overhead and DLQ accumulation; start at
+the 5 GiB topic limit, measure actual storage and alert on backlog/DLQ depth and age. See Part C
+for the Premium cost trade-off.
 
 ## 7. Operations access (FR7)
 
@@ -699,7 +751,7 @@ stored in `outbox.last_error_code` (for example `PARTIAL_REFUND_REQUIRES_REVIEW`
 never payer personal data, which the canonical event does not carry in the first place (NFR6). The
 code is an operational label, not a provider payload, so it adds no personal data.
 
-Lookups are by `provider_transaction_id` and by `policy_number`, exactly what FR7 asks for. There is no
+Lookups are scoped by provider and support event ID, provider transaction ID and policy number. There is no
 search by payer name: supporting it would mean storing personal data the design deliberately does not
 keep.
 
@@ -707,11 +759,11 @@ Every query is audited with who asked, when, and which identifier was searched �
 and never payer data. Bulk export is not available and the endpoint is rate limited, so the query API
 cannot become a data dump.
 
-Reprocessing a failed or dead-lettered notification is a separate permission, `payments:replay`. It is
-not granted with read access, because replay writes to Salesforce: it requires a justification, is
-audited with the identifier of the replayed batch, and is safe to repeat because the write is an upsert
-on the immutable `Payment_Key__c` (ADR-0001), so a mistake is corrected by retrying rather than by
-compensating.
+Reprocessing a failed or dead-lettered notification requires a separate permission,
+`payments:replay`, a justification and an audited batch identifier. It requeues eligible work, not
+an unconditional write. The destination rechecks eligibility and ordering; a remote outcome that
+is still ambiguous must be reconciled first. The immutable `Payment_Key__c` prevents duplicate
+payment records but does not make an old state safe to write.
 
 **Retention of the query view.** The query view answers over the same store as §5.1. The 13 months
 are the intended hot-data horizon, not a deletion date: while no purge runs — that is, until the
@@ -727,7 +779,7 @@ claim and the same audit — instead of introducing a second way to read payment
 
 | # | Item | Blocked by |
 |---|---|---|
-| A1 | Compute choice for the intake service and the relay | moved to Part C |
+| A1 | Target compute and private network | selected in [Part C](../infra/AZURE_SERVICES.md); deployment remains unverified |
 | A2 | Retention: the 13-month **hot-data window** is set, per-country configurable (§5.1), with no purge while the detailed archive does not exist. Legal retention by record category and country, the service level for queries answered from the archive, raw provider payload storage, and retirement of `DONE` `outbox` rows remain **open** | compliance input (NFR6) |
 | A3 | ~~ADR-0001: sync vs async, per record vs batch, budget and availability protection~~ | **closed** — `docs/adr/0001-salesforce-integration.md` |
 | A4 | ~~Dead-letter thresholds: attempt caps and backoff curve per failure class~~ | **closed** — retry taxonomy in ADR-0001 |

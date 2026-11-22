@@ -4,8 +4,8 @@
 - **Date:** 2026-11-19
 - **Approved by:** the candidate, 2026-11-21
 - **Scope note (2026-11-21):** the canonical event is published from a second outbox destination
-  (ADR-0002 amendment). This does not change the Salesforce decision recorded here; the relay still
-  drains the `SALESFORCE` destination and writes batches exactly as decided below.
+  (ADR-0002 amendment). Batching below is a production target. The local relay drains
+  `SALESFORCE` using a simulator; it does not send collection requests or prove their SLOs.
 
 ## Context
 
@@ -46,8 +46,9 @@ The intake service calls Salesforce before answering the provider.
   exactly when it is already degraded. At the month-end peak it is 120,000 calls/day, which is 80% of
   the integration budget before any retry, leaving no room for the org-wide shared limit. When
   Salesforce is down, the provider retries for its own window (3 days for Quetzal, 5 attempts in 24 h
-  for Andina, 8 in 48 h for Austral) and anything beyond that window is lost forever, which violates
-  NFR3. Concurrency is capped at 25 requests, so the intake is coupled to a throughput ceiling it
+  for Andina, 8 in 48 h for Austral). A notification never accepted during that outage may need
+  reconciliation outside the retry window; a timeout can also leave an ambiguous write outcome.
+  Concurrency is capped at 25 requests, so the intake is coupled to a throughput ceiling it
   does not control.
 - Verdict: rejected. It trades durability for simplicity in a scenario where durability is the point.
 
@@ -69,10 +70,9 @@ transaction, answers the provider, and a relay drains the outbox using the colle
 (`PATCH /composite/sobjects/Premium_Payment__c/Payment_Key__c`, up to **200 records per call**, one
 API call regardless of record count), flushing on `min(200 records, 60 seconds)`.
 
-- Pros: 600 to 1,440 calls/day against a 150,000 budget (≤1%); `allOrNone: false` gives one result
-  per record, so a single bad payment does not discard the other 199; availability is absorbed in the
-  outbox, and a full backlog drains in minutes once Salesforce returns; the 60-second flush keeps the
-  5-minute freshness target reachable at the overnight rate of ~0.17 notifications/s.
+- Pros: the once-through planning envelope needs <2% of the 150,000-call rolling budget at
+  200 records per full batch; `allOrNone: false` isolates bad records; the outbox holds work during
+  outages, and a time-based flush avoids a ~20-minute fill wait at the normal average of ~0.17/s.
 - Cons: up to 60 seconds of added latency before the write is attempted; a batch mixes countries,
   currencies and even several states of the same payment, so ordering must be resolved **before**
   building the batch, not by Salesforce; per-record results must be bookkept to know what succeeded;
@@ -140,37 +140,40 @@ relay classifies first:
 |---|---|---|
 | `401 INVALID_SESSION_ID` | Refresh the cached token once, retry immediately | No |
 | `400 UNABLE_TO_LOCK_ROW` | Retry with exponential backoff (1, 2, 4 … capped at 300 s) | Yes |
-| `5xx`, timeout | Same backoff curve, up to 12 attempts (~1 h), then dead-letter | Yes |
+| Isolated `5xx` / transport failure with a known non-write | Same backoff, up to 12 send attempts (11 waits ≈18.5 min before jitter/processing), then dead-letter | Yes |
+| Systemic outage or repeated `5xx` | Open the shared dependency circuit; queue untouched work and probe on cooldown | Only real sends/probes count toward the API budget |
+| Timeout with an unknown write outcome | Hold that payment key; reconcile the remote marker before retrying or advancing its state | Count the attempted call |
 | `400 INVALID_FIELD` / `REQUIRED_FIELD_MISSING` | Dead-letter immediately, no retry | No |
 | `403 REQUEST_LIMIT_EXCEEDED` | Open the circuit breaker, release the batch untouched, stop draining | No |
 
-The circuit breaker reopens after a 15-minute cooldown with a single probe request, and a usage
-guard pauses draining at 90% of the per-integration budget and alerts at 70%. Pausing is ugly;
-triggering the org-wide `403` is worse, because it takes down integrations that are not ours.
+After a 15-minute cooldown a single probe may move the circuit to closed if successful; otherwise
+it stays open. A usage guard pauses draining at 90% of the per-integration budget and alerts at 70%.
+Pauses preserve queued jobs without consuming their retry attempts. Alert on backlog age; a queue
+that survives an outage can still miss freshness.
 
 ### Capacity and recovery
 
 | Metric | Value |
 |---|---|
-| Peak notifications per day | 120,000 |
-| Records per collection call | up to 200 |
-| Calls per day, theoretical minimum | 600 |
-| Calls per day, worst case (one flush per minute) | 1,440 |
-| Budget utilisation | ≤1% of 150,000 |
-| Concurrent requests used | 4 of 25 |
-| Backlog after a full 22-hour outage | ~110,000 records |
-| Drain time at 4 concurrent calls, p50 1.5 s | ~3.5 minutes |
+| Peak day | 116,400 unique events after 3% duplicate traffic |
+| Once-through collection calls | 582 full batches; modeled upper envelope 2,022 including up to one partial flush/minute |
+| Rolling 24-hour sensitivity | Up to 2,604 modeled calls across two calendar-day peaks, before retries or auxiliary calls |
+| Concurrency | Up to 4 of 25, only across different payment keys |
+| Example outage | ~41,000 queued events: 15 minutes at burst plus 75 minutes at peak-day average |
+| Example catch-up | ~14 min with 50 successful records/s and new arrivals at 1.35/s; ~61 min at 38.8/s |
 
-The 97% availability budget (~21.9 hours per month) fits inside the 5% lateness allowance of NFR2
-(~36.5 hours), so an outage breaches the 5-minute target without breaching the monthly objective, as
-long as the backlog drains and the lateness is attributed to the Salesforce SLO instead of hidden.
+The recovery example assumes 100 successful records every 8 s per writer; validate capacity and
+budget in load and failure tests. The 97% time-based availability does not assure payment-based
+freshness. A 90-minute outage starting with the 15-minute burst leaves ~34,920 unique events already
+over one hour old when writes resume. NFR2 is at risk, particularly its 99.5% within one hour target.
+Report the impact per country, including late and unresolved payments. See [capacity and test
+gates](../design/SOLUTION_DESIGN.md#65-salesforce-calls-freshness-and-availability).
 
 ## Consequences
 
-- Positive: the provider contract is met independently of Salesforce health; the API budget is used
-  at ~1% and retries cannot turn a Salesforce incident into a self-inflicted outage; a bad record
-  fails alone; a full outage recovers in minutes; every failure ends in a named destination instead
-  of a log line.
+- Positive: intake acknowledgment is independent of Salesforce health; batching and a shared
+  budget guard bound pressure on the dependency; a bad record fails alone; recoverable work is
+  durable and failures end in a named destination instead of a log line.
 - Negative: up to 60 seconds of added latency before the write is attempted, which is visible to the
   contact center; the relay is new code and new state to operate, with its own failure modes (stuck
   claims, relay down while the outbox grows); `allOrNone: false` requires per-record bookkeeping or
@@ -178,7 +181,7 @@ long as the backlog drains and the lateness is attributed to the Salesforce SLO 
   a fourth provider is blocked on a configuration change outside the team.
 - Risks and how they are mitigated: a relay that dies while the outbox grows is detected by backlog
   age, not by error rate (alert on the age of the oldest unsent row); ordering must be applied when
-  building the batch, because two states of the same payment inside one call would let Salesforce
-  apply them in array order, so the relay groups by `payment_key` and sends the winning status last;
+  building the batch: send at most one eligible state per `payment_key` in flight, rather than
+  relying on collection array order. Reconcile ambiguous remote outcomes before sending a newer state;
   the 60-second window is an SLI, not an implementation detail, because a regression there breaks
   NFR2 silently.
