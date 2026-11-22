@@ -8,8 +8,8 @@ and final submission checks remain the candidate's responsibility.
 - [x] `SUBMISSION.md` completed (including the final commit SHA you will send to your recruiter)
 - [x] Candidate reviewed and confirmed the disclosure in `AI_USAGE.md`
 - [x] `docs/ASSUMPTIONS.md` lists every assumption you made
-- [ ] Candidate verified the scope and results of the working-tree and history security scans
-- [ ] Candidate confirmed the final submission repository is **public**
+- [x] Candidate verified the scope and results of the working-tree and history security scans
+- [x] Candidate confirmed the final submission repository is **public**
 
 ## Part A — Integration and data design
 - [x] `docs/design/SOLUTION_DESIGN.md` (context diagram, sequence diagram, canonical event and mapping, idempotency and ordering, error handling, capacity, data, FR7)
