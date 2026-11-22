@@ -5,6 +5,8 @@
 - **Approved by:** Fabián, explicit approval, 2026-11-21 (local, UTC-05)
 - **Amendment approved by:** Fabián, explicit approval of the canonical-event publication package, 2026-11-21 (America/Bogota, UTC-05; date verified with `date`)
 - **Candidate confirmation:** data store — PostgreSQL Flexible Server B1MS — confirmed on 2026-11-21; the stack below is the decision of record that the design and Part B are built on.
+- **Delivery refinement:** Service Bus Premium is the private-network target; B1MS and 64 GB are
+  starting sizes, not verified production limits. See [Part C](../infra/AZURE_SERVICES.md).
 
 ## Context
 
@@ -31,9 +33,9 @@ ADR sizes is the inbox insert, two outbox inserts, one `payment_state` upsert an
 claim/completion updates (two per row across the two destinations). The upsert is an insert for the
 first event of a payment and an update
 afterwards, split by the 1.1 events-per-payment assumption, and it is counted once, never folded into
-the three inserts. That yields ≈152 inserts/s — inbox, both outbox rows and the insert fraction of
-the upsert, not three inserts alone — and ≈310 row operations/s during the 40/s burst
-(`docs/design/SOLUTION_DESIGN.md` §6). That is a derived estimate, not a benchmark.
+the three inserts. Including the ordering outcome update, that yields ≈152 inserts/s and ≈349
+logical row operations/s at the 40/s burst before retries and additional bookkeeping
+(`docs/design/SOLUTION_DESIGN.md` §6). This is not a benchmark.
 
 ## Options considered
 
@@ -76,8 +78,8 @@ the upsert, not three inserts alone — and ≈310 row operations/s during the 4
 
 - Pros: fixed monthly cost; unique index; the SQL Server model the Salesforce-side team already
   knows.
-- Cons: S0 is a 10-DTU tier, and ≈310 row operations/s at the burst is not a load it is specified
-  for, so throttling would arrive exactly in the window that must be survived. Batching reduces
+- Cons: S0 is a 10-DTU tier, and ≈349 logical row operations/s at the burst is not a load it is
+  specified for, so throttling is a risk that needs testing. Batching reduces
   Salesforce calls, not the database write rate, so it does not remove the sizing question.
   S1 costs ≈ $29.03 per month.
 - Verdict: viable second choice.
@@ -109,13 +111,14 @@ the upsert, not three inserts alone — and ≈310 row operations/s during the 4
    Manager. Provider parsing, signature verification and state mapping live in one adapter per
    provider, which is what keeps the design portable to Mule 4 if the organisation imposes it.
    Justification rests on `README.md`:16, `TASKS.md`:24 and `SCENARIO.md`:18.
-2. **Messaging:** Azure Service Bus **Standard topic** with independent `finance` and
+2. **Messaging:** Azure Service Bus **Premium private topic** with independent `finance` and
    `notifications` subscriptions and dead-letter enabled on each subscription, as drawn in
    `docs/design/SOLUTION_DESIGN.md` §1.2 and §2. The canonical event is published from the `CANONICAL_EVENT`
    outbox destination; the Salesforce relay polls the `SALESFORCE` destination directly. *Amended
    2026-11-21: the original decision was a queue between intake and relay; see the amendment below.*
-3. **Data store:** **Azure Database for PostgreSQL, Flexible Server, B1MS, fixed billing**,
-   confirmed by the candidate on 2026-11-21. Schema, keys and indexes as in `docs/design/SOLUTION_DESIGN.md` §5:
+3. **Data store:** **Azure Database for PostgreSQL, Flexible Server** with B1MS as the initial
+   sizing candidate and an explicit SKU and tier parameter for scale-up. Logical schema, keys and
+   indexes are in `docs/design/SOLUTION_DESIGN.md` §5:
    `payment_event` with unique `(provider, event_id)`, `payment_state` keyed by `payment_key`,
    `outbox` keyed by `outbox_id` with unique `(payment_event_id, destination)` and an index on
    `(destination, status, next_attempt_at, outbox_id)`, a small `worker_lease` row for single-active
@@ -133,9 +136,13 @@ acceptance of the original ADR.
 
 #### What changed
 
-- The Service Bus **queue between intake and relay** is replaced by a **Service Bus Standard topic**
+- The Service Bus **queue between intake and relay** was replaced by a **Service Bus topic**
   with two independent subscriptions, `finance` and `notifications`. The consumers behind those
   subscriptions are out of implementation scope (FR6).
+- The subsequent delivery refinement selects **Premium (1 MU)** to support Private Link. Standard
+  would meet the message shape and probably the volume, but requires a public endpoint with
+  tightly allowlisted fixed egress for all clients. The higher baseline cost buys private network
+  isolation, not a guarantee of throughput. Revisit if network policy allows that alternative.
 - Intake no longer publishes to the broker. In the same transaction that inserts the inbox row it
   inserts **two outbox jobs**: `SALESFORCE` and `CANONICAL_EVENT`.
 - The Salesforce relay polls only the `SALESFORCE` destination. The event publisher polls only the
@@ -172,35 +179,23 @@ Prices read from the Azure Retail Prices API (`eastus`, consumption meters) on 2
 | Item | Unit price | Monthly |
 |---|---|---|
 | PostgreSQL Flexible Server B1MS | $0.017 / hour | ≈ $12.41 (730 h) |
-| Storage | $0.115 / GB-month | ≈ $4.60 (40 GB) |
-| Service Bus Standard base unit | $10.00 / month | ≈ $10.00 (base unit only; operations and brokered connections not included) |
+| Storage | $0.115 / GB-month | ≈ $7.36 (64 GB) |
+| Service Bus Premium, 1 MU | Planning allowance ≈ $1/hour (not a verified quote) | ≈ $730 (730 h) |
 | Azure SQL serverless, 0.5 vCore — rejected | $0.521758 / vCore-hour | ≈ $190.44 (730 h) |
 | Azure SQL Standard S0 — rejected | $0.4839 / day | ≈ $14.52 (30 days) |
 | Azure SQL Standard S1 — rejected | $0.9677 / day | ≈ $29.03 (30 days) |
 
-Storage sizing (amended 2026-11-21) comes from `docs/design/SOLUTION_DESIGN.md` §6: 15,000 notifications/day on
-normal days and 120,000/day on the four month-end days, 3% duplicates, three inserts per unique event
-(inbox plus two outbox jobs), one `payment_state` upsert and four outbox claim/completion updates (two
-per row across the two destinations) give
-≈876,600 notifications and ≈850,300 unique events per average month, ≈6.8 million row writes and
-≈1.6 GB of live data per month. The 13-month hot window is therefore ≈20.7 GB before WAL, index bloat
-and backups, or ≈26.9 GB with 30% overhead; 40 GB of provisioned storage covers it with headroom.
-Without the future archive, accumulation continues at ≈1.6 GB/month of live data (≈2.1 GB with the
-same overhead), so the same 40 GB is exhausted at roughly 19 months. This is a derived estimate, not a
-benchmark, and it does not prove that B1MS sustains the burst. The Service Bus base unit price is from
-the Retail Prices API (`eastus`, 2026-11-21); messaging operations, brokered connections and any
-tiering are not modeled here and are quoted in Part C. No full Service Bus monthly estimate is claimed
-in this ADR.
+Storage uses the §6 design model: ≈850,300 unique events/month, ≈7.65 million logical row writes
+and ~50 GB over 13 months including modeled WAL/bloat headroom, before audit/replay and backups.
+Start at 64 GB; measure actual sizes and growth. Costs and exclusions are in Part C.
 
 ## Consequences
 
-- Positive: every test in the deliverable can actually be executed; the store satisfies FR4, FR5 and
-  FR7 without application-level deduplication tricks; compute is ≈ $12.41 per month, storage
-  ≈ $4.60 and the Service Bus Standard base unit ≈ $10.00 (operations excluded), the cheapest viable
-  combination of the four; the burst-credit model fits the load shape; the stack choice does not alter
-  the Salesforce budget or freshness analysis in ADR-0001.
+- Positive: the local tests need no cloud credentials; the relational store provides the transaction
+  and uniqueness needed for FR4 and the state and indexes needed for FR5/FR7. B1MS is inexpensive
+  if testing confirms its burst capacity. The broker's private networking dominates cloud cost.
 - Negative: B-series credits are finite, so a month-end burst longer than the credit balance degrades
-  to baseline exactly when freshness matters; two outbox rows per event raise the burst to ≈310 row
+  to baseline exactly when freshness matters; the modeled burst is ≈349 logical row
   operations/s, and this ADR does not prove that B1MS sustains it; a single B1MS instance is a single
   point of failure unless zone redundancy or a replica is added, which this design does not deliver;
   PostgreSQL is an engine the Salesforce-side team does not operate; Mule is the corporate default and
@@ -211,8 +206,8 @@ in this ADR.
   of the month, because that is when the burst is longest; the 40/s burst is a load-test gate in Part
   C, and if B1MS cannot sustain it the SKU is a parameter, not a commitment; storage is alerted at 75%
   and 85% because no purge runs and the future archive is not implemented; the relay's Salesforce
-  concurrency is bounded to 4 of 25 (ADR-0001), so the drain rate is predictable and the writer is not
-  the bottleneck; if the organisation imposes Mule, the provider adapters are the only code that has
+  concurrency is bounded to 4 of 25 (ADR-0001); the drain rate remains a validation gate. If the
+  organisation imposes Mule, the provider adapters are the only code that has
   to be re-hosted; if the store is later moved to SQL Server, the schema, keys and indexes carry over,
   but the claim uses `FOR UPDATE SKIP LOCKED` and the single-active lease, which need SQL Server
   equivalents (`READPAST`/`UPDLOCK` and an application lock) rather than a copy-paste.
