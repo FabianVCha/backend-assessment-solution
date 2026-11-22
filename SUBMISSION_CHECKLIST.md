@@ -5,8 +5,8 @@ Technical files marked below are present in the local handoff. Candidate informa
 and final submission checks remain the candidate's responsibility.
 
 ## General
-- [ ] `SUBMISSION.md` completed (including the final commit SHA you will send to your recruiter)
-- [ ] Candidate reviewed and confirmed the disclosure in `AI_USAGE.md`
+- [x] `SUBMISSION.md` completed (including the final commit SHA you will send to your recruiter)
+- [x] Candidate reviewed and confirmed the disclosure in `AI_USAGE.md`
 - [x] `docs/ASSUMPTIONS.md` lists every assumption you made
 - [ ] Candidate verified the scope and results of the working-tree and history security scans
 - [ ] Candidate confirmed the final submission repository is **public**

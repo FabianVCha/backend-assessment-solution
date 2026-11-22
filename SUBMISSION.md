@@ -15,13 +15,13 @@
 
 | Part | Approximate time |
 |---|---|
-| A. Integration and data design | Candidate to complete |
-| B. Integration component | Candidate to complete |
-| C. Azure IaC and CI/CD | Candidate to complete |
-| D. Operations | Candidate to complete |
-| E. Code review | Candidate to complete |
-| F. Responsible AI | Candidate to complete |
-| **Total** | Candidate to complete |
+| A. Integration and data design | 4 hours |
+| B. Integration component | 3 hours |
+| C. Azure IaC and CI/CD | 2 hours |
+| D. Operations | 30 minutes |
+| E. Code review | 30 minutes |
+| F. Responsible AI | 30 minutes |
+| **Total** | 10 hours 30 minutes |
 
 ## Stack
 
