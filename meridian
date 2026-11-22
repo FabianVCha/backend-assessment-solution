@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+"""Launch Meridian Ops. A local demo profile grants read-only access."""
+
+import os
+from pathlib import Path
+import re
+import sys
+
+ROOT = Path(__file__).resolve().parent
+sys.path[:0] = [str(ROOT / "ops-console"), str(ROOT)]
+
+from console import main as console_main
+from tools.local_demo import jwt
+
+
+def local_profile(path):
+    if not path.exists():
+        return {}
+    if path.stat().st_mode & 0o077:
+        raise ValueError("Make the local demo profile private with chmod 600.")
+    allowed = {"INTAKE_LOCAL_PORT", "INTAKE_OPS_ISSUER", "INTAKE_OPS_AUDIENCE", "INTAKE_OPS_HS256_KEY_BASE64"}
+    result = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key in allowed:
+            result[key] = value.strip()
+    return result
+
+
+def run(arguments):
+    # Never mint a demo token when an origin was explicitly selected.
+    if not any(arg in ("-h", "--help", "--base-url") or arg.startswith("--base-url=") for arg in arguments):
+        try:
+            profile = local_profile(ROOT / ".meridian.local.env")
+            port = profile.get("INTAKE_LOCAL_PORT", "8080")
+            if not re.fullmatch(r"[1-9][0-9]{0,4}", port) or int(port) > 65535:
+                raise ValueError("Invalid local demo port.")
+            if profile:
+                if not os.environ.get("OPS_TOKEN") and "INTAKE_OPS_HS256_KEY_BASE64" in profile:
+                    os.environ.update({key: value for key, value in profile.items() if key.startswith("INTAKE_OPS_")})
+                    os.environ["OPS_TOKEN"] = jwt(["CL", "CO", "MX"], False)
+                arguments = ["--base-url", f"http://127.0.0.1:{port}", *arguments]
+        except (OSError, ValueError):
+            print("Cannot load the private local demo profile. See LOCAL_DEMO.md or use an explicit --base-url.",
+                  file=sys.stderr)
+            return 2
+    return console_main(arguments)
+
+
+if __name__ == "__main__":
+    raise SystemExit(run(sys.argv[1:]))
