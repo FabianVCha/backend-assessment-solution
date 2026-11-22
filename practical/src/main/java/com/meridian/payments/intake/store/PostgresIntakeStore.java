@@ -135,18 +135,18 @@ public final class PostgresIntakeStore implements IntakeStore, OutboxStore {
             ON CONFLICT (payment_key) DO UPDATE
             SET observed_events = payment_state.observed_events + 1,
                 updated_at = now(),
-                latest_status = CASE
-                    WHEN EXCLUDED.latest_status_changed_at >= payment_state.latest_status_changed_at
-                    THEN EXCLUDED.latest_status ELSE payment_state.latest_status END,
-                latest_event_id = CASE
-                    WHEN EXCLUDED.latest_status_changed_at >= payment_state.latest_status_changed_at
-                    THEN EXCLUDED.latest_event_id ELSE payment_state.latest_event_id END,
-                latest_status_changed_at = CASE
-                    WHEN EXCLUDED.latest_status_changed_at >= payment_state.latest_status_changed_at
-                    THEN EXCLUDED.latest_status_changed_at ELSE payment_state.latest_status_changed_at END,
-                latest_received_at = CASE
-                    WHEN EXCLUDED.latest_status_changed_at >= payment_state.latest_status_changed_at
-                    THEN EXCLUDED.latest_received_at ELSE payment_state.latest_received_at END
+                (latest_status, latest_event_id, latest_status_changed_at, latest_received_at) = (
+                    SELECT candidate.status, candidate.event_id, candidate.changed_at, candidate.received_at
+                    FROM (VALUES
+                        (EXCLUDED.latest_status, EXCLUDED.latest_event_id,
+                         EXCLUDED.latest_status_changed_at, EXCLUDED.latest_received_at),
+                        (payment_state.latest_status, payment_state.latest_event_id,
+                         payment_state.latest_status_changed_at, payment_state.latest_received_at)
+                    ) AS candidate(status, event_id, changed_at, received_at)
+                    ORDER BY candidate.changed_at DESC, payment_status_rank(candidate.status) DESC,
+                             candidate.event_id COLLATE "C" DESC
+                    LIMIT 1
+                )
             """;
 
     private final Database database;

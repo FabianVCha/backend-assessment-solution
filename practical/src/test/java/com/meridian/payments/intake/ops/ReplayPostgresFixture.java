@@ -49,7 +49,7 @@ abstract class ReplayPostgresFixture {
     @BeforeEach
     void emptyTables() throws SQLException {
         execute("TRUNCATE replay_command, outbox_job, payment_event, payment_state, "
-                + "salesforce_budget, salesforce_budget_call");
+                + "salesforce_budget, salesforce_budget_call, salesforce_budget_lease");
     }
 
     static Map<String, String> jdbcEnvironment() {
