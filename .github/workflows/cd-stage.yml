@@ -1,0 +1,44 @@
+name: cd stage
+
+on:
+  workflow_call:
+    inputs:
+      stage:
+        required: true
+        type: string
+      release_digest:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.stage }}
+    env:
+      STAGE: ${{ inputs.stage }}
+      RELEASE_DIGEST: ${{ inputs.release_digest }}
+      STAGE_READY: ${{ vars.STAGE_RUNTIME_READY }}
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP }}
+      NAME_PREFIX: ${{ vars.NAME_PREFIX }}
+      DB_ADMIN_GROUP_ID: ${{ vars.DB_ADMIN_GROUP_ID }}
+      DB_ADMIN_GROUP_NAME: ${{ vars.DB_ADMIN_GROUP_NAME }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: check release inputs before Azure login
+        run: bash .github/workflows/deploy-stage.sh check
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+      - name: install pinned Bicep compiler
+        run: az bicep install --version v0.49.2
+      - name: verify release manifest, preview and apply
+        run: bash .github/workflows/deploy-stage.sh apply

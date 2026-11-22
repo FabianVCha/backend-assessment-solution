@@ -1,6 +1,6 @@
 # Local profile: real PostgreSQL, the intake process, and nothing that needs a cloud credential.
 #
-# The two webhook secrets are the sandbox vectors published by the exercise in
+# The three webhook secrets are the sandbox vectors published by the exercise in
 # reference/providers/*/WEBHOOK_SPEC.md. They are test material, not provider credentials.
 name: premium-payment-intake
 
@@ -14,7 +14,7 @@ services:
       # this account exists outside a developer machine; in Azure the app uses its managed identity.
       POSTGRES_PASSWORD: local-demo-only
     ports:
-      - "127.0.0.1:55432:5432"
+      - "127.0.0.1:${INTAKE_DB_LOCAL_PORT:-55432}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U intake -d intake"]
       interval: 2s
@@ -40,7 +40,7 @@ services:
       ANDINA_WEBHOOK_SECRET: andina_test_secret_7c3e19ab # gitleaks:allow
       AUSTRAL_WEBHOOK_SECRET: aus_test_whsec_2b9d6f10 # gitleaks:allow
     ports:
-      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:${INTAKE_LOCAL_PORT:-8080}:8080"
 
 volumes:
   intake-data:

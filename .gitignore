@@ -3,6 +3,9 @@ target/
 build/
 .gradle/
 *.class
+# Python local console
+__pycache__/
+*.pyc
 # Mule / Anypoint Studio
 .mule/
 .settings/

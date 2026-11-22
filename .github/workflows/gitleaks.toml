@@ -1,0 +1,27 @@
+# CI extends the default detectors and exempts only exact fictional fixture values.
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+
+  [[rules.allowlists]]
+  description = "Exact public sandbox signing vectors used by the assessment"
+  regexTarget = "secret"
+  regexes = [
+    '''^(qz_test_whsec_4f8a1c2e9b7d|andina_test_secret_7c3e19ab|aus_test_whsec_2b9d6f10)$''',
+  ]
+
+  [[rules.allowlists]]
+  description = "Exact synthetic payment tokens in the three Quetzal example payloads"
+  condition = "AND"
+  paths = ['''^reference/providers/quetzal-mx/samples/0[123]-charge-(succeeded|failed|refunded)\.json$''']
+  regexTarget = "secret"
+  regexes = ['''^(tok_qz_9sD2fK|tok_qz_1aB7cD)$''']
+
+  [[rules.allowlists]]
+  description = "One intentionally insecure and fictional secret in the PR-214 review exercise"
+  condition = "AND"
+  paths = ['''^pr-review/PR-214\.diff$''']
+  regexTarget = "secret"
+  regexes = ['''^aus_live_whsec_8KfQ2mZx7RtV4pLs$''']
