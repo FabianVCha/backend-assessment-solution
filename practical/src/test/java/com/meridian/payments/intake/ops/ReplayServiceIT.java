@@ -56,6 +56,7 @@ class ReplayServiceIT extends ReplayPostgresFixture {
     @Test
     void theSameKeyReturnsTheFirstOutcomeWithoutResettingAgain() throws Exception {
         accept("old", "PAY-1", "POL-CO-000000001", "CAPTURED", Instant.EPOCH);
+        markFailed(Destination.SALESFORCE);
         assertEquals("REQUEUED", replay("old", "First justification", "r-1").name());
         assertEquals(1, relay(new SimulatedSalesforce()).drain());
 
@@ -69,6 +70,7 @@ class ReplayServiceIT extends ReplayPostgresFixture {
     @Test
     void aKeyCannotReportSuccessForAnotherDestination() throws Exception {
         accept("old", "PAY-1", "POL-CO-000000001", "CAPTURED", Instant.EPOCH);
+        markFailed(Destination.SALESFORCE);
         var output = new ByteArrayOutputStream();
         try (var stream = new PrintStream(output, true, StandardCharsets.UTF_8)) {
             assertEquals(0, runCli(stream, "old", "SALESFORCE", "r-1"));
@@ -85,6 +87,7 @@ class ReplayServiceIT extends ReplayPostgresFixture {
     @Test
     void concurrentIdenticalCommandsResetOnce() throws Exception {
         accept("old", "PAY-1", "POL-CO-000000001", "CAPTURED", Instant.EPOCH);
+        markFailed(Destination.SALESFORCE);
         execute("""
                 CREATE TABLE replay_test_reset (outbox_id bigint);
                 CREATE FUNCTION replay_test_count_reset() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -178,6 +181,7 @@ class ReplayServiceIT extends ReplayPostgresFixture {
     @Test
     void cliPrintsARejectionForAnUnknownDestinationOrEventAndCanReplayCanonical() throws Exception {
         accept("old", "PAY-1", "POL-CO-000000001", "CAPTURED", Instant.EPOCH);
+        markFailed(Destination.CANONICAL_EVENT);
         var output = new ByteArrayOutputStream();
         try (var stream = new PrintStream(output, true, StandardCharsets.UTF_8)) {
             assertEquals(1, runCli(stream, "old", "UNKNOWN", "r-1"));
@@ -190,6 +194,23 @@ class ReplayServiceIT extends ReplayPostgresFixture {
         assertEquals("PENDING/REPLAY/0", job("old", Destination.CANONICAL_EVENT));
         assertNull(scalar("SELECT remote_applied_status FROM payment_state"));
         assertNotNull(scalar("SELECT requested_at::text FROM replay_command WHERE idempotency_key = 'r-3'"));
+    }
+
+    @Test
+    void ordinaryReplayCannotRequeueAnUnattemptedAppliedOrHeldWrite() throws Exception {
+        accept("old", "PAY-1", "POL-CO-000000001", "CAPTURED", Instant.EPOCH);
+        assertEquals("JOB_NOT_REPLAYABLE", replay("old", "Unattempted", "r-1").name());
+        relay(new SimulatedSalesforce()).drain();
+        assertEquals("JOB_NOT_REPLAYABLE", replay("old", "Already applied", "r-2").name());
+        assertEquals("PUBLISHED/APPLIED/0", job("old", Destination.SALESFORCE));
+        accept("held", "PAY-2", "POL-CO-000000001", "CAPTURED", Instant.EPOCH);
+        relay(new SimulatedSalesforce(SalesforceClient.Result.LOST_RESPONSE)).drain();
+        assertEquals("RECONCILIATION_REQUIRED", replay("held", "Unknown result", "r-3").name());
+        assertEquals("HELD/LOST_RESPONSE/0", job("held", Destination.SALESFORCE));
+    }
+
+    private static void markFailed(Destination destination) throws Exception {
+        execute("UPDATE outbox_job SET attempts = 1 WHERE destination = '" + destination.name() + "'");
     }
 
     private static int runCli(PrintStream output, String eventId, String destination, String key) {

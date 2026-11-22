@@ -20,7 +20,8 @@ public final class ReplayService {
 
     public enum Outcome {
         REQUEUED, KEY_REQUIRED, KEY_TARGET_CONFLICT, REQUESTER_REQUIRED, REASON_REQUIRED,
-        PROVIDER_UNKNOWN, DESTINATION_UNKNOWN, EVENT_NOT_FOUND, JOB_NOT_FOUND, JOB_CLAIMED
+        PROVIDER_UNKNOWN, DESTINATION_UNKNOWN, EVENT_NOT_FOUND, JOB_NOT_FOUND, JOB_CLAIMED,
+        RECONCILIATION_REQUIRED, JOB_NOT_REPLAYABLE
     }
 
     private static final String REGISTER = """
@@ -41,7 +42,8 @@ public final class ReplayService {
             FROM payment_event WHERE provider = ? AND event_id = ?
             """;
     private static final String LOCK_JOB = """
-            SELECT outbox_id, state FROM outbox_job WHERE intake_id = ? AND destination = ? FOR UPDATE
+            SELECT outbox_id, state, attempts, outcome_code
+            FROM outbox_job WHERE intake_id = ? AND destination = ? FOR UPDATE
             """;
     private static final String RESET = """
             UPDATE outbox_job
@@ -188,8 +190,18 @@ public final class ReplayService {
                 if (!rows.next()) {
                     return Outcome.JOB_NOT_FOUND;
                 }
-                if ("CLAIMED".equals(rows.getString("state"))) {
+                String state = rows.getString("state");
+                if ("CLAIMED".equals(state)) {
                     return Outcome.JOB_CLAIMED;
+                }
+                if ("HELD".equals(state)) {
+                    return Outcome.RECONCILIATION_REQUIRED;
+                }
+                if (!"DEAD".equals(state) && !("PENDING".equals(state)
+                        && rows.getInt("attempts") > 0 && !"RATE_LIMITED".equals(rows.getString("outcome_code"))
+                        && !"BUDGET_EXHAUSTED".equals(rows.getString("outcome_code"))
+                        && !"REPLAY".equals(rows.getString("outcome_code")))) {
+                    return Outcome.JOB_NOT_REPLAYABLE;
                 }
                 outboxId = rows.getLong("outbox_id");
             }

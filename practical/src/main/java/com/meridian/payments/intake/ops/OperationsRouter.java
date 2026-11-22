@@ -167,7 +167,8 @@ public final class OperationsRouter implements HttpHandler {
         return switch (outcome) {
             case REQUEUED -> ok(JSON.createObjectNode().put("outcome", outcome.name()));
             case EVENT_NOT_FOUND, JOB_NOT_FOUND -> error(404, "NOT_FOUND");
-            case KEY_TARGET_CONFLICT, JOB_CLAIMED -> error(409, outcome.name());
+            case KEY_TARGET_CONFLICT, JOB_CLAIMED, RECONCILIATION_REQUIRED, JOB_NOT_REPLAYABLE ->
+                    error(409, outcome.name());
             default -> error(400, "INVALID_REQUEST");
         };
     }

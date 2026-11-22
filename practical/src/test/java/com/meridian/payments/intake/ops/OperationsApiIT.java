@@ -231,6 +231,21 @@ class OperationsApiIT extends ReplayPostgresFixture {
     }
 
     @Test
+    void heldAndUnattemptedHttpReplayDoNotResetTheQueue() throws Exception {
+        try (var database = open(); var server = start(database)) {
+            accept("unknown", "pair", "policy", "CAPTURED", NOW);
+            var replay = token("replay", "CO");
+            error(409, "JOB_NOT_REPLAYABLE",
+                    request(server, "/replays", replay, replayBody("ANDINA", "unknown", "case-18")));
+            relay(new SimulatedSalesforce(SalesforceClient.Result.LOST_RESPONSE)).drain();
+            error(409, "RECONCILIATION_REQUIRED",
+                    request(server, "/replays", replay, replayBody("ANDINA", "unknown", "case-18")));
+            assertEquals(0, count("replay_command"));
+            assertEquals("HELD/LOST_RESPONSE/0", job("unknown", Destination.SALESFORCE));
+        }
+    }
+
+    @Test
     void returnsCommittedReplayOutcomeAndIsolatesKeysByCountry() throws Exception {
         try (var database = open(); var server = start(database)) {
             accept("co", "one", "policy", "CAPTURED", NOW);
