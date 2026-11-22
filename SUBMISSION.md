@@ -8,8 +8,8 @@
 | Field | Value |
 |---|---|
 | Candidate ID (provided by your recruiter) | fabian.vasquez.a0952@gmail.com |
-| Final commit SHA | f7151b5270fae7d7398f091ab55407176a203a97 |
-| Date and time of submission (with time zone) | 2026-11-21 21:31:49 -05 (-05:00) |
+| Final commit SHA | 96c4d2bb12e589a6bc92f60287a119024b50517d |
+| Date and time of submission (with time zone) | 2026-11-21 21:44:52 -05 (-05:00) |
 
 ## Time spent
 
