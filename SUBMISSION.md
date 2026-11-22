@@ -1,38 +1,44 @@
 # Submission
 
-> Complete every section. Keep it short — this is the reviewers' entry point.
+> Candidate handoff: the factual implementation summary is ready for review. The candidate must
+> provide their own identity, timing and final submission details before sending.
 
 ## Candidate
 
 | Field | Value |
 |---|---|
-| Candidate ID (provided by your recruiter) | |
-| Final commit SHA | |
-| Date and time of submission (with time zone) | |
+| Candidate ID (provided by your recruiter) | Candidate to complete |
+| Final commit SHA | Candidate to complete after reviewing and committing the files |
+| Date and time of submission (with time zone) | Candidate to complete |
 
 ## Time spent
 
 | Part | Approximate time |
 |---|---|
-| A. Integration and data design | |
-| B. Integration component | |
-| C. Azure IaC and CI/CD | |
-| D. Operations | |
-| E. Code review | |
-| F. Responsible AI | |
-| **Total** | |
+| A. Integration and data design | Candidate to complete |
+| B. Integration component | Candidate to complete |
+| C. Azure IaC and CI/CD | Candidate to complete |
+| D. Operations | Candidate to complete |
+| E. Code review | Candidate to complete |
+| F. Responsible AI | Candidate to complete |
+| **Total** | Candidate to complete |
 
 ## Stack
 
-- Practical part (Part B): <!-- e.g., Mule 4.x + DataWeave 2 + MUnit 3 / Java 21 + Spring Boot 3.x -->
-- Infrastructure as code: <!-- Bicep / Terraform, version -->
-- Pipeline: <!-- GitHub Actions / Azure Pipelines -->
-- CI run link (optional):
+- Practical part (Part B): Java 21, Maven, JUnit 5, a PostgreSQL 16 local profile, and external-service stubs.
+- Infrastructure as code: Azure Bicep.
+- Pipeline: GitHub Actions; deployment definitions only, not exercised against Azure.
+- Optional product extension: terminal console over the country-scoped operations API; Python 3 standard library.
 
 ## Where to start reading
 
-<!-- Point reviewers to the two or three files that best show your thinking. -->
+1. [Architecture and capacity](docs/design/SOLUTION_DESIGN.md) — end-to-end design, trade-offs and estimates.
+2. [Practical implementation and evidence](practical/README.md) — provider adapters, transactional acceptance and regressions.
+3. [Local demonstration](LOCAL_DEMO.md) — Docker Compose, fictional signed events and the optional console.
 
 ## Known gaps and what I would do next
 
-<!-- Be honest: what is incomplete, what you would change with more time, and in what order. -->
+- The broker and Salesforce are simulated locally. Production approval requires authorized verification of private access, identity, publish acknowledgements, Salesforce reconciliation and ordering semantics.
+- The operations profile uses local HS256 tokens, not a production identity provider. The console is optional and cannot bypass the API's permissions.
+- A sustained production-sized workload, database restore and Azure rollout were not executed. Do not infer SLA compliance from the local test suite.
+- See [AI disclosure](AI_USAGE.md) for provenance; the candidate should review and update it to reflect their own work and validation before sending.
